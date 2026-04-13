@@ -764,14 +764,28 @@ function SignalFeed() {
   const [signals, setSignals] = useState([])
   const [loading, setLoading] = useState(true)
   const [collapsed, setCollapsed] = useState(false)
+  const [limit, setLimit] = useState(5)
+  const [refreshKey, setRefreshKey] = useState(0)
+  const [fresh, setFresh] = useState(false)
 
   useEffect(() => {
     let alive = true
     const load = () => {
-      getRecentSignals(60).then(d => { if (alive) { setSignals(d); setLoading(false) } }).catch(() => { if (alive) setLoading(false) })
+      getRecentSignals(60).then(d => {
+        if (!alive) return
+        setSignals(prev => {
+          if (prev.length > 0 && d[0]?.id !== prev[0]?.id) {
+            setFresh(true)
+            setTimeout(() => setFresh(false), 800)
+            setRefreshKey(k => k + 1)
+          }
+          return d
+        })
+        setLoading(false)
+      }).catch(() => { if (alive) setLoading(false) })
     }
     load()
-    const t = setInterval(load, 15000)
+    const t = setInterval(load, 5000)
     return () => { alive = false; clearInterval(t) }
   }, [])
 
@@ -780,18 +794,38 @@ function SignalFeed() {
     return `${d.getMonth() + 1}/${d.getDate()} ${d.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' })}`
   }
 
+  const shown = signals.slice(0, limit)
+
   return (
     <div className="bg-dark-800 rounded-xl border border-dark-600 overflow-hidden">
       {/* 标题栏 */}
       <div
-        className="flex items-center justify-between px-4 py-2.5 cursor-pointer select-none border-b border-dark-600"
-        onClick={() => setCollapsed(v => !v)}
+        className="flex items-center justify-between px-4 py-2.5 border-b border-dark-600"
       >
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 cursor-pointer select-none" onClick={() => setCollapsed(v => !v)}>
+          <span className={clsx('w-1.5 h-1.5 rounded-full shrink-0', fresh ? 'bg-accent-green animate-ping' : 'bg-gray-700')} />
           <span className="text-sm font-semibold text-gray-300">喊单信号流</span>
           <span className="text-xs text-gray-600">({signals.length})</span>
+          <span className={clsx('text-gray-600 text-xs transition-transform', collapsed ? '' : 'rotate-180')}>▼</span>
         </div>
-        <span className={clsx('text-gray-600 text-xs transition-transform', collapsed ? '' : 'rotate-180')}>▼</span>
+        {/* 显示条数控制 */}
+        {!collapsed && (
+          <div className="flex items-center gap-1.5" onClick={e => e.stopPropagation()}>
+            <span className="text-xs text-gray-600">显示</span>
+            {[5, 10, 20, 50].map(n => (
+              <button
+                key={n}
+                onClick={() => setLimit(n)}
+                className={clsx(
+                  'text-xs px-2 py-0.5 rounded border transition-colors',
+                  limit === n
+                    ? 'border-accent-blue text-accent-blue bg-accent-blue/10'
+                    : 'border-dark-500 text-gray-600 hover:text-gray-300 hover:border-gray-500'
+                )}
+              >{n}</button>
+            ))}
+          </div>
+        )}
       </div>
 
       {!collapsed && (
@@ -815,16 +849,18 @@ function SignalFeed() {
                   <th className="text-center px-4 py-2 font-medium">买入</th>
                 </tr>
               </thead>
-              <tbody>
-                {signals.map((s, i) => {
+              <tbody key={refreshKey}>
+                {shown.map((s, i) => {
                   const chainCls = CHAIN_BADGE[s.chain?.toLowerCase()] || 'text-gray-400 bg-gray-400/10'
                   const isPassed = s.filter_passed
                   const isBought = s.bought
                   return (
                     <tr key={s.id} className={clsx(
-                      'border-b border-dark-700/50 hover:bg-dark-700/20 transition-colors',
+                      'border-b border-dark-700/50 hover:bg-dark-700/20 transition-colors log-item-enter',
                       isBought && 'bg-green-900/10'
-                    )}>
+                    )}
+                      style={{ animationDelay: `${i * 30}ms` }}
+                    >
                       <td className="px-4 py-1.5 font-mono text-gray-500 whitespace-nowrap">{fmt(s.received_at)}</td>
                       <td className="px-2 py-1.5">
                         {s.group_id
