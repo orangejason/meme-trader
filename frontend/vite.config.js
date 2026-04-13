@@ -5,6 +5,12 @@ const backendPort = process.env.BACKEND_PORT || '8000'
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    minify: 'esbuild',
+    rollupOptions: {
+      treeshake: false,
+    },
+  },
   server: {
     port: 5173,
     proxy: {

@@ -38,3 +38,5 @@ body {
 .pnl-negative { color: #ff4466; }
 
 .log-text { font-size: 15px; line-height: 1.6; }
+
+[data-log-area] { font-size: 15px !important; line-height: 1.6 !important; }

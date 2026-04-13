@@ -18,11 +18,18 @@ const TYPE_BADGE = {
 
 export default function LiveLog({ logs, connected }) {
   const bottomRef = useRef(null)
+  const logAreaRef = useRef(null)
+
+  useEffect(() => {
+    if (logAreaRef.current) {
+      logAreaRef.current.style.fontSize = '15px'
+      logAreaRef.current.style.lineHeight = '1.6'
+    }
+  }, [])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [logs])
-
   return (
     <Card className="flex flex-col h-full">
       <div className="flex items-center justify-between mb-3">
@@ -32,7 +39,7 @@ export default function LiveLog({ logs, connected }) {
           <span className="text-xs text-gray-500">{connected ? '已连接' : '断开'}</span>
         </div>
       </div>
-      <div className="flex-1 overflow-y-auto font-mono log-text space-y-1 min-h-0" style={{maxHeight: 'calc(100vh - 280px)'}}>
+      <div ref={logAreaRef} data-log-area="" className="flex-1 overflow-y-auto font-mono text-base space-y-1 min-h-0" style={{maxHeight: 'calc(100vh - 280px)'}}>
         {logs.length === 0 && (
           <div className="text-gray-600 text-center py-8">等待事件...</div>
         )}
