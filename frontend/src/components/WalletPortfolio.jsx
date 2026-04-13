@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { clsx } from 'clsx'
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
@@ -75,7 +75,7 @@ export default function WalletPortfolio() {
   }, [])
 
   // 首次渲染时自动加载（不查余额，只加载持仓）
-  useState(() => { refresh() }, [])
+  useEffect(() => { refresh() }, [])
 
   const toggleChain = (chain) =>
     setExpandedChains(prev => ({ ...prev, [chain]: !prev[chain] }))
