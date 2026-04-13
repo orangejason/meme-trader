@@ -1,8 +1,21 @@
 import { clsx } from 'clsx'
+import { useState, useEffect, useRef } from 'react'
 
-export function Card({ children, className }) {
+// 值变化时触发数字滚入动画
+function useRoll(value) {
+  const prev = useRef(value)
+  const [key, setKey] = useState(0)
+  useEffect(() => {
+    if (prev.current === value) return
+    prev.current = value
+    setKey(k => k + 1)
+  }, [value])
+  return key
+}
+
+export function Card({ children, className, style }) {
   return (
-    <div className={clsx('bg-dark-800 rounded-xl border border-dark-600 p-4', className)}>
+    <div className={clsx('bg-dark-800 rounded-xl border border-dark-600 p-4', className)} style={style}>
       {children}
     </div>
   )
@@ -75,13 +88,36 @@ export function Toggle({ checked, onChange, label }) {
   )
 }
 
-export function StatCard({ label, value, sub, color = 'white' }) {
+export function StatCard({ label, value, sub, color = 'white', index = 0, winRate }) {
   const colors = { white: 'text-white', green: 'text-accent-green', red: 'text-accent-red', yellow: 'text-accent-yellow' }
+  const rollKey = useRoll(value)
   return (
-    <Card>
+    <Card
+      className="stat-enter"
+      style={{ animationDelay: `${index * 80}ms` }}
+    >
       <div className="text-xs text-gray-500 mb-1">{label}</div>
-      <div className={clsx('text-2xl font-bold font-mono', colors[color])}>{value}</div>
-      {sub && <div className="text-xs text-gray-500 mt-1">{sub}</div>}
+      <div key={rollKey} className={clsx('text-2xl font-bold font-mono count-roll', colors[color])}>{value}</div>
+      {winRate != null ? (
+        <div className="mt-2">
+          <div className="flex justify-between text-xs text-gray-600 mb-0.5">
+            <span>胜率</span><span className="text-gray-400">{winRate}%</span>
+          </div>
+          <div className="h-1 bg-dark-600 rounded-full overflow-hidden">
+            <div
+              key={rollKey}
+              className="h-full rounded-full bar-fill"
+              style={{
+                width: `${Math.min(winRate, 100)}%`,
+                backgroundColor: winRate >= 50 ? '#00ff87' : winRate >= 30 ? '#facc15' : '#ff4466',
+                animationDelay: `${index * 80 + 200}ms`,
+              }}
+            />
+          </div>
+        </div>
+      ) : sub ? (
+        <div className="text-xs text-gray-500 mt-1">{sub}</div>
+      ) : null}
     </Card>
   )
 }

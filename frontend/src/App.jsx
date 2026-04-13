@@ -243,11 +243,13 @@ function Dashboard({ stats, posCount, onRefresh }) {
       {/* 1. 统计卡片 */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
         <StatCard
+          index={0}
           label="总交易次数"
           value={stats?.total_trades ?? '—'}
-          sub={`胜率 ${stats?.win_rate ?? 0}%`}
+          winRate={stats?.win_rate ?? null}
         />
         <StatCard
+          index={1}
           label="总盈亏(含Gas)"
           value={stats ? (() => {
             const net = (stats.total_pnl_usdt ?? 0) - (stats.total_gas_usd ?? 0)
@@ -257,18 +259,21 @@ function Dashboard({ stats, posCount, onRefresh }) {
           sub={`交易P&L ${stats ? (stats.total_pnl_usdt >= 0 ? '+' : '') + stats.total_pnl_usdt?.toFixed(3) : '—'}U`}
         />
         <StatCard
+          index={2}
           label="胜/负"
           value={stats ? `${stats.win_trades}/${stats.loss_trades}` : '—'}
           color="white"
           sub={`总投入 ${stats?.total_invested?.toFixed(2) ?? 0}U`}
         />
         <StatCard
+          index={3}
           label="当前持仓"
           value={posCount}
           color={posCount > 0 ? 'yellow' : 'white'}
           sub="活跃仓位"
         />
         <StatCard
+          index={4}
           label="Gas 消耗"
           value={stats?.total_gas_usd != null ? `~${stats.total_gas_usd.toFixed(3)}U` : '—'}
           color="white"
@@ -798,7 +803,7 @@ function GasBreakdown() {
               <span className="text-xs text-gray-300 w-20 shrink-0 truncate" title={display}>{display}</span>
               {/* 进度条 */}
               <div className="flex-1 h-1.5 bg-dark-600 rounded-full overflow-hidden">
-                <div className="h-full bg-orange-500/60 rounded-full" style={{ width: `${barPct}%` }} />
+                <div className="h-full bg-orange-500/60 rounded-full bar-fill" style={{ width: `${barPct}%`, animationDuration: '1s' }} />
               </div>
               {/* Gas 金额 */}
               <span className="font-mono text-orange-400 text-[11px] w-16 text-right shrink-0">
