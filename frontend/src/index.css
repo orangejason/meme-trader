@@ -36,3 +36,5 @@ body {
 
 .pnl-positive { color: #00ff87; }
 .pnl-negative { color: #ff4466; }
+
+.log-text { font-size: 15px; line-height: 1.6; }
