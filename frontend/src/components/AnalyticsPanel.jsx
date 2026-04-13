@@ -9,6 +9,16 @@ import { clsx } from 'clsx'
 
 const API = ''
 
+// 与后端一致的4位哈希编号，用于脱敏发币人名称
+function shortHash(s) {
+  if (!s) return '????'
+  let h = 0
+  for (let i = 0; i < s.length; i++) {
+    h = Math.imul(31, h) + s.charCodeAt(i) | 0
+  }
+  return (h >>> 0).toString(16).slice(0, 4).toUpperCase().padStart(4, '0')
+}
+
 const CHAIN_COLORS = {
   SOL: '#9945FF',
   BSC: '#F0B90B',
@@ -343,7 +353,7 @@ function SenderLeaderboardCard({ days }) {
         : data.length === 0
         ? <div className="text-gray-500 text-sm py-4 text-center">暂无数据</div>
         : (
-          <div className="overflow-x-auto max-h-96 overflow-y-auto">
+          <div className="overflow-x-auto max-h-[480px] overflow-y-auto">
             <table className="w-full text-xs text-gray-400">
               <thead className="sticky top-0 bg-dark-800">
                 <tr className="border-b border-dark-600 text-gray-500">
@@ -368,7 +378,10 @@ function SenderLeaderboardCard({ days }) {
                   >
                     {/* 发币人 */}
                     <td className="py-1.5 pr-2 font-mono text-gray-300 max-w-[90px] truncate">
-                      <span title={r.sender}>{r.sender}</span>
+                      <span
+                        className="bg-orange-900/20 text-orange-400/80 px-1.5 py-0.5 rounded text-[11px]"
+                        title="发币人已脱敏为编号"
+                      >#{shortHash(r.sender)}</span>
                       {!r.has_trade && (
                         <span className="ml-1 text-gray-600 text-[10px]">无买入</span>
                       )}
@@ -470,7 +483,7 @@ function CaFeedTable({ days }) {
         </div>
       </div>
       <div className="text-xs text-gray-500 mb-2">共 {data.total} 条</div>
-      <div className="overflow-x-auto">
+      <div className="overflow-x-auto max-h-[480px] overflow-y-auto">
         <table className="w-full text-xs text-gray-400">
           <thead>
             <tr className="border-b border-dark-600 text-gray-500">
@@ -624,7 +637,7 @@ export default function AnalyticsPanel({ days = 7 }) {
       <PnlCurveCard days={days} />
 
       {/* 第三行：发币人排行 + CA 流水 */}
-      <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-5 gap-4 items-start">
         <div className="lg:col-span-2">
           <SenderLeaderboardCard days={days} />
         </div>
