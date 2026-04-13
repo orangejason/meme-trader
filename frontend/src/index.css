@@ -40,3 +40,40 @@ body {
 .log-text { font-size: 15px; line-height: 1.6; }
 
 [data-log-area] { font-size: 15px !important; line-height: 1.6 !important; }
+
+/* 价格上涨闪烁 */
+@keyframes flash-green {
+  0%   { color: #00ff87; text-shadow: 0 0 8px #00ff8780; }
+  100% { color: inherit; text-shadow: none; }
+}
+/* 价格下跌闪烁 */
+@keyframes flash-red {
+  0%   { color: #ff4466; text-shadow: 0 0 8px #ff446680; }
+  100% { color: inherit; text-shadow: none; }
+}
+.price-up   { animation: flash-green 0.8s ease-out; }
+.price-down { animation: flash-red   0.8s ease-out; }
+
+/* 日志条目入场动画 */
+@keyframes log-enter {
+  from { opacity: 0; transform: translateX(12px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.log-item-enter { animation: log-enter 0.25s ease-out; }
+
+/* 卡片弹出 */
+@keyframes card-pop {
+  0%   { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  60%  { transform: translateY(1px) scale(1.005); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+.card-pop { animation: card-pop 0.3s ease-out; }
+
+/* Header 数字跳动 */
+@keyframes num-bump {
+  0%   { transform: scale(1); }
+  40%  { transform: scale(1.18); }
+  100% { transform: scale(1); }
+}
+.num-bump { animation: num-bump 0.35s ease-out; }
+

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { getPositions, closePosition, getWalletBalances, sellBatch } from '../api'
 import { Card, Badge, PnlValue, Button } from './UI'
 import { clsx } from 'clsx'
@@ -41,6 +41,51 @@ export function TokenLogo({ url, name, size = 24 }) {
     />
   )
 }
+
+// 价格闪烁 hook：价格变化时返回 'price-up' | 'price-down' | ''
+function usePriceFlash(value) {
+  const prev = useRef(value)
+  const [cls, setCls] = useState('')
+  useEffect(() => {
+    if (prev.current === null || prev.current === undefined || value === prev.current) {
+      prev.current = value
+      return
+    }
+    const dir = value > prev.current ? 'price-up' : 'price-down'
+    prev.current = value
+    setCls(dir)
+    const t = setTimeout(() => setCls(''), 900)
+    return () => clearTimeout(t)
+  }, [value])
+  return cls
+}
+
+// PnL 进度条：从止损(-30%) 到止盈(+50%)
+function PnlBar({ pnl_pct, stopLoss = 30, takeProfit = 50 }) {
+  const total = stopLoss + takeProfit          // 80
+  const pct = Math.max(-stopLoss, Math.min(takeProfit, pnl_pct ?? 0))
+  const pos = ((pct + stopLoss) / total) * 100 // 0~100%
+  const color = pct >= 0 ? '#00ff87' : '#ff4466'
+  const zeroPos = (stopLoss / total) * 100     // 零轴位置
+
+  return (
+    <div className="relative h-1 bg-dark-600 rounded-full overflow-hidden mt-1" style={{ minWidth: 60 }}>
+      {/* 零轴 */}
+      <div className="absolute top-0 bottom-0 w-px bg-gray-600" style={{ left: `${zeroPos}%` }} />
+      {/* 进度 */}
+      <div
+        className="absolute top-0 bottom-0 rounded-full transition-all duration-500"
+        style={{
+          backgroundColor: color,
+          left: pct >= 0 ? `${zeroPos}%` : `${pos}%`,
+          width: `${Math.abs(pos - zeroPos)}%`,
+          opacity: 0.85,
+        }}
+      />
+    </div>
+  )
+}
+
 
 export default function PositionsTable({ onRefresh }) {
   const [tab, setTab] = useState('bot')
@@ -137,41 +182,47 @@ function BotPositions({ onRefresh }) {
             </thead>
             <tbody>
               {positions.map(p => (
-                <tr key={p.id} className="border-b border-dark-700 hover:bg-dark-700/30">
-                  <td className="py-2 pr-3">
-                    <Badge color={CHAIN_COLOR[p.chain] || 'gray'}>{p.chain}</Badge>
-                  </td>
-                  <td className="py-2 pr-3">
-                    <TokenCell logo_url={p.logo_url} token_name={p.token_name} symbol={p.symbol} ca={p.ca} />
-                  </td>
-                  <td className="text-right py-2 pr-3 font-mono text-gray-400">{fmtPrice(p.entry_price)}</td>
-                  <td className="text-right py-2 pr-3 font-mono text-orange-400/80">
-                    {p.gas_fee_usd > 0 ? p.gas_fee_usd.toFixed(4) : '—'}
-                  </td>
-                  <td className="text-right py-2 pr-3 font-mono text-gray-300">{fmtPrice(p.current_price)}</td>
-                  <td className="text-right py-2 pr-3 font-mono text-gray-300">{p.amount_usdt}</td>
-                  <td className="text-right py-2 pr-3">
-                    <div><PnlValue value={p.pnl_usdt} /></div>
-                    <div className={p.pnl_pct >= 0 ? 'text-accent-green' : 'text-accent-red'}>
-                      {p.pnl_pct >= 0 ? '+' : ''}{p.pnl_pct?.toFixed(1)}%
-                    </div>
-                  </td>
-                  <td className="text-right py-2 pr-3 text-gray-500">{fmtDuration(p.hold_minutes)}</td>
-                  <td className="text-right py-2">
-                    <Button
-                      size="sm"
-                      variant="danger"
-                      disabled={loading}
-                      onClick={() => handleClose(p.id)}
-                    >卖出</Button>
-                  </td>
-                </tr>
+                <PositionRow key={p.id} p={p} loading={loading} onClose={handleClose} />
               ))}
             </tbody>
           </table>
         </div>
       )}
     </div>
+  )
+}
+
+// ── 单行持仓（带价格闪烁 + PnL进度条） ─────────────────────────
+function PositionRow({ p, loading, onClose }) {
+  const flashCls = usePriceFlash(p.current_price)
+  return (
+    <tr className="border-b border-dark-700 hover:bg-dark-700/30">
+      <td className="py-2 pr-3">
+        <Badge color={CHAIN_COLOR[p.chain] || 'gray'}>{p.chain}</Badge>
+      </td>
+      <td className="py-2 pr-3">
+        <TokenCell logo_url={p.logo_url} token_name={p.token_name} symbol={p.symbol} ca={p.ca} />
+      </td>
+      <td className="text-right py-2 pr-3 font-mono text-gray-400">{fmtPrice(p.entry_price)}</td>
+      <td className="text-right py-2 pr-3 font-mono text-orange-400/80">
+        {p.gas_fee_usd > 0 ? p.gas_fee_usd.toFixed(4) : '—'}
+      </td>
+      <td className={`text-right py-2 pr-3 font-mono text-gray-300 ${flashCls}`}>
+        {fmtPrice(p.current_price)}
+      </td>
+      <td className="text-right py-2 pr-3 font-mono text-gray-300">{p.amount_usdt}</td>
+      <td className="text-right py-2 pr-3">
+        <div><PnlValue value={p.pnl_usdt} /></div>
+        <div className={p.pnl_pct >= 0 ? 'text-accent-green' : 'text-accent-red'}>
+          {p.pnl_pct >= 0 ? '+' : ''}{p.pnl_pct?.toFixed(1)}%
+        </div>
+        <PnlBar pnl_pct={p.pnl_pct} />
+      </td>
+      <td className="text-right py-2 pr-3 text-gray-500">{fmtDuration(p.hold_minutes)}</td>
+      <td className="text-right py-2">
+        <Button size="sm" variant="danger" disabled={loading} onClick={() => onClose(p.id)}>卖出</Button>
+      </td>
+    </tr>
   )
 }
 

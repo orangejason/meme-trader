@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { getTradeStats, getPositions, getConfig, updateConfig, getTradeHistory } from './api'
 import { useWebSocket } from './hooks/useWebSocket'
 import ConfigPanel from './components/ConfigPanel'
@@ -21,6 +21,22 @@ const TABS = [
   { id: 'gas', label: '⛽ Gas' },
   { id: 'config', label: '配置' },
 ]
+
+// 数字跳动 hook：值变化时触发 num-bump 动画
+function useNumBump(value) {
+  const [cls, setCls] = useState('')
+  const prev = useRef(value)
+  useEffect(() => {
+    if (prev.current !== value && prev.current !== undefined) {
+      setCls('num-bump')
+      const t = setTimeout(() => setCls(''), 400)
+      prev.current = value
+      return () => clearTimeout(t)
+    }
+    prev.current = value
+  }, [value])
+  return cls
+}
 
 export default function App() {
   const [tab, setTab] = useState('dashboard')
@@ -93,6 +109,8 @@ export default function App() {
               {connected ? 'WS 已连接' : 'WS 断开'}
             </div>
           </div>
+          {/* 实时指标 */}
+          <HeaderStats stats={stats} posCount={posCount} />
           <Toggle
             checked={botEnabled}
             onChange={handleBotToggle}
@@ -363,7 +381,7 @@ function SideLog({ logs, connected }) {
       const d = log.data || {}
       const name = d.symbol || d.token_name || (d.ca ? d.ca.slice(0, 8) + '…' : '—')
       return (
-        <div key={log.id} className="rounded-xl border border-green-800/50 bg-green-900/15 px-3 py-2.5 space-y-1.5">
+        <div key={log.id} className="rounded-xl border border-green-800/50 bg-green-900/15 px-3 py-2.5 space-y-1.5 card-pop">
           {/* 头部：icon + 名称 + 链 + 时间 */}
           <div className="flex items-center gap-1.5 min-w-0">
             <TokenLogo url={d.logo_url} name={name} size={16} />
@@ -401,7 +419,7 @@ function SideLog({ logs, connected }) {
       const netPnl = hasGas ? (d.pnl_usdt || 0) - d.gas_fee_usd : null
       return (
         <div key={log.id} className={clsx(
-          'rounded-xl border px-3 py-2.5 space-y-1.5',
+          'rounded-xl border px-3 py-2.5 space-y-1.5 card-pop',
           profit ? 'border-green-800/50 bg-green-900/15' : 'border-red-900/50 bg-red-900/10'
         )}>
           {/* 头部 */}
@@ -462,7 +480,7 @@ function SideLog({ logs, connected }) {
       const d = log.data || {}
       const name = d.token_name || (d.ca ? d.ca.slice(0, 8) + '…' : '—')
       return (
-        <div key={log.id} className="rounded-xl border border-red-800/60 bg-red-900/15 px-3 py-2.5 space-y-1.5">
+        <div key={log.id} className="rounded-xl border border-red-800/60 bg-red-900/15 px-3 py-2.5 space-y-1.5 card-pop">
           <div className="flex items-center gap-1.5 min-w-0">
             <span className="text-xs font-bold text-red-400 shrink-0">❌ 买入失败</span>
             <span className="text-gray-100 font-semibold text-sm truncate flex-1">{name}</span>
@@ -496,7 +514,7 @@ function SideLog({ logs, connected }) {
       const triggerLabel = SELL_REASON_ZH[d.sell_reason] || ''
       const isAbandoned = d.abandoned === true
       return (
-        <div key={log.id} className={`rounded-xl border px-3 py-2.5 space-y-1.5 ${isAbandoned ? 'border-red-700/80 bg-red-950/30' : 'border-orange-800/60 bg-orange-900/10'}`}>
+        <div key={log.id} className={`rounded-xl border px-3 py-2.5 space-y-1.5 card-pop ${isAbandoned ? 'border-red-700/80 bg-red-950/30' : 'border-orange-800/60 bg-orange-900/10'}`}>
           <div className="flex items-center gap-1.5 min-w-0">
             <span className={`text-xs font-bold shrink-0 ${isAbandoned ? 'text-red-400' : 'text-orange-400'}`}>
               {isAbandoned ? '🚨 放弃卖出' : '⚠ 卖出失败'}
@@ -537,7 +555,7 @@ function SideLog({ logs, connected }) {
       const qwfcDelta = d.qwfc_delta || 0
       const isHot = qwfcDelta >= 10  // 热度暴涨标记
       return (
-        <div key={log.id} className="flex items-center gap-1.5 px-1 py-0.5 hover:bg-white/[0.02] rounded group">
+        <div key={log.id} className="flex items-center gap-1.5 px-1 py-0.5 hover:bg-white/[0.02] rounded group log-item-enter">
           <span className="text-gray-700 shrink-0 tabular-nums text-xs">{ts}</span>
           <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${isFirst ? 'bg-blue-500/60' : 'bg-gray-600/60'}`} />
           {isFirst
@@ -565,7 +583,7 @@ function SideLog({ logs, connected }) {
     const textCls = meta?.cls || LEVEL_STYLE[log.level] || 'text-gray-400'
     const dotCls = meta?.dot || (log.level === 'error' ? 'bg-red-500' : log.level === 'warn' ? 'bg-yellow-500' : 'bg-gray-600')
     return (
-      <div key={log.id} className="flex items-start gap-1.5 px-1 py-0.5 hover:bg-white/[0.02] rounded">
+      <div key={log.id} className="flex items-start gap-1.5 px-1 py-0.5 hover:bg-white/[0.02] rounded log-item-enter">
         <span className="text-gray-700 shrink-0 tabular-nums text-xs mt-0.5">{ts}</span>
         <span className={clsx('w-1.5 h-1.5 rounded-full shrink-0 mt-1', dotCls)} />
         <span className={clsx('text-xs break-all leading-relaxed', textCls)}>{msg}</span>
@@ -604,6 +622,49 @@ function SideLog({ logs, connected }) {
         )}
         {/* 正序显示，最新在底部 */}
         {[...logs].reverse().map(log => renderLog(log))}
+      </div>
+    </div>
+  )
+}
+
+// ── Header 实时指标 ───────────────────────────────────────────────
+function HeaderStats({ stats, posCount }) {
+  const todayPnl = stats ? ((stats.total_pnl_usdt ?? 0) - (stats.total_gas_usd ?? 0)) : null
+  const trades   = stats?.total_trades ?? null
+
+  const pnlCls  = useNumBump(todayPnl)
+  const posCls  = useNumBump(posCount)
+  const tradeCls = useNumBump(trades)
+
+  return (
+    <div className="hidden md:flex items-center gap-5">
+      <div className="flex flex-col items-center">
+        <span className="text-[10px] text-gray-600 leading-none mb-0.5">净盈亏</span>
+        <span className={clsx(
+          'text-sm font-bold font-mono tabular-nums',
+          todayPnl === null ? 'text-gray-600' : todayPnl >= 0 ? 'text-accent-green' : 'text-accent-red',
+          pnlCls
+        )}>
+          {todayPnl === null ? '—' : `${todayPnl >= 0 ? '+' : ''}${todayPnl.toFixed(2)}U`}
+        </span>
+      </div>
+      <div className="w-px h-6 bg-dark-500" />
+      <div className="flex flex-col items-center">
+        <span className="text-[10px] text-gray-600 leading-none mb-0.5">总交易</span>
+        <span className={clsx('text-sm font-bold font-mono text-gray-300', tradeCls)}>
+          {trades ?? '—'}
+        </span>
+      </div>
+      <div className="w-px h-6 bg-dark-500" />
+      <div className="flex flex-col items-center">
+        <span className="text-[10px] text-gray-600 leading-none mb-0.5">持仓</span>
+        <span className={clsx(
+          'text-sm font-bold font-mono',
+          posCount > 0 ? 'text-accent-yellow' : 'text-gray-500',
+          posCls
+        )}>
+          {posCount}
+        </span>
       </div>
     </div>
   )
