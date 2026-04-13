@@ -22,20 +22,19 @@ const TABS = [
   { id: 'config', label: '配置' },
 ]
 
-// 数字跳动 hook：值变化时触发 num-bump 动画
-function useNumBump(value) {
-  const [cls, setCls] = useState('')
+// 数字滚动 hook：值变化时触发向上滚入动画，返回 [显示值, className]
+function useCountUp(value, format) {
+  const [display, setDisplay] = useState({ val: value, key: 0 })
   const prev = useRef(value)
   useEffect(() => {
-    if (prev.current !== value && prev.current !== undefined) {
-      setCls('num-bump')
-      const t = setTimeout(() => setCls(''), 400)
-      prev.current = value
-      return () => clearTimeout(t)
-    }
+    if (prev.current === value) return
     prev.current = value
+    setDisplay(d => ({ val: value, key: d.key + 1 }))
   }, [value])
-  return cls
+  const formatted = value === null || value === undefined
+    ? '—'
+    : format ? format(value) : String(value)
+  return [formatted, display.key]
 }
 
 export default function App() {
@@ -101,7 +100,13 @@ export default function App() {
       <header className="border-b border-dark-600 bg-dark-800 sticky top-0 z-30 shrink-0">
         <div className="px-4 h-14 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <span className="text-lg font-bold text-white">Holdo.AI × AVE Trader</span>
+            <div className="flex items-center gap-2">
+              <div className={clsx(
+                'w-2.5 h-2.5 rounded-full shrink-0',
+                botEnabled ? 'bg-accent-green bot-glow' : 'bg-gray-600'
+              )} />
+              <span className="text-lg font-bold text-white">Holdo.AI × AVE Trader</span>
+            </div>
             <div className={clsx(
               'text-xs px-2 py-0.5 rounded-full',
               connected ? 'bg-green-900/40 text-green-400' : 'bg-red-900/40 text-red-400'
@@ -600,7 +605,11 @@ function SideLog({ logs, connected }) {
     <div className="flex flex-col h-full">
       {/* 标题栏 */}
       <div className="flex items-center justify-between px-3 py-2.5 border-b border-dark-600 shrink-0">
-        <span className="text-xs font-semibold text-gray-300">实时日志</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-semibold text-gray-300">实时日志</span>
+          {/* 心跳波形 */}
+          <HeartbeatLine active={connected} />
+        </div>
         <div className="flex items-center gap-2">
           {!autoScroll && (
             <button
@@ -637,7 +646,6 @@ function HeaderStats({ stats, posCount }) {
   const todayPnl = stats ? ((stats.total_pnl_usdt ?? 0) - (stats.total_gas_usd ?? 0)) : null
   const trades   = stats?.total_trades ?? null
 
-  // 资产总额（各链 native + USDT + 持仓估值）
   const [totalAsset, setTotalAsset] = useState(null)
   useEffect(() => {
     let alive = true
@@ -645,61 +653,67 @@ function HeaderStats({ stats, posCount }) {
       .then(r => r.ok ? r.json() : null)
       .then(d => {
         if (!alive || !d) return
-        // native_balance 需要乘以链价格，portfolio 里暂时用 position_value 近似
         const usdt = d.chains.reduce((s, c) => s + (Number(c.usdt_balance) || 0), 0)
         const pos  = d.total_position_value_usdt || 0
         setTotalAsset(usdt + pos)
       })
       .catch(() => {})
     return () => { alive = false }
-  }, [posCount]) // 持仓变化时刷新
+  }, [posCount])
 
-  const pnlCls   = useNumBump(todayPnl)
-  const posCls   = useNumBump(posCount)
-  const tradeCls = useNumBump(trades)
-  const assetCls = useNumBump(totalAsset)
+  const [assetStr, assetKey]  = useCountUp(totalAsset, v => v === null ? '—' : `$${v.toFixed(2)}`)
+  const [pnlStr,   pnlKey]    = useCountUp(todayPnl,   v => v === null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(2)}U`)
+  const [tradeStr, tradeKey]  = useCountUp(trades,     v => v === null ? '—' : String(v))
+  const [posStr,   posKey]    = useCountUp(posCount,   v => String(v))
+
+  const Num = ({ val, rollKey, color }) => (
+    <span key={rollKey} className={clsx('text-sm font-bold font-mono tabular-nums count-roll', color)}>
+      {val}
+    </span>
+  )
 
   return (
     <div className="flex items-center gap-5">
-      {/* 当前资产 */}
       <div className="flex flex-col items-center">
         <span className="text-[10px] text-gray-600 leading-none mb-0.5">当前资产</span>
-        <span className={clsx('text-sm font-bold font-mono tabular-nums text-yellow-400', assetCls)}>
-          {totalAsset === null ? '—' : `$${totalAsset.toFixed(2)}`}
-        </span>
+        <Num val={assetStr} rollKey={assetKey} color="text-yellow-400" />
       </div>
       <div className="w-px h-6 bg-dark-500" />
-      {/* 净盈亏 */}
       <div className="flex flex-col items-center">
         <span className="text-[10px] text-gray-600 leading-none mb-0.5">净盈亏</span>
-        <span className={clsx(
-          'text-sm font-bold font-mono tabular-nums',
-          todayPnl === null ? 'text-gray-600' : todayPnl >= 0 ? 'text-accent-green' : 'text-accent-red',
-          pnlCls
-        )}>
-          {todayPnl === null ? '—' : `${todayPnl >= 0 ? '+' : ''}${todayPnl.toFixed(2)}U`}
-        </span>
+        <Num val={pnlStr} rollKey={pnlKey} color={todayPnl === null ? 'text-gray-600' : todayPnl >= 0 ? 'text-accent-green' : 'text-accent-red'} />
       </div>
       <div className="w-px h-6 bg-dark-500" />
-      {/* 总交易 */}
       <div className="flex flex-col items-center">
         <span className="text-[10px] text-gray-600 leading-none mb-0.5">总交易</span>
-        <span className={clsx('text-sm font-bold font-mono text-gray-300', tradeCls)}>
-          {trades ?? '—'}
-        </span>
+        <Num val={tradeStr} rollKey={tradeKey} color="text-gray-300" />
       </div>
       <div className="w-px h-6 bg-dark-500" />
-      {/* 持仓 */}
       <div className="flex flex-col items-center">
         <span className="text-[10px] text-gray-600 leading-none mb-0.5">持仓</span>
-        <span className={clsx(
-          'text-sm font-bold font-mono',
-          posCount > 0 ? 'text-accent-yellow' : 'text-gray-500',
-          posCls
-        )}>
-          {posCount}
-        </span>
+        <Num val={posStr} rollKey={posKey} color={posCount > 0 ? 'text-accent-yellow' : 'text-gray-500'} />
       </div>
+    </div>
+  )
+}
+
+// ── 心跳波形 ─────────────────────────────────────────────────────
+const BARS = [0.15, 0.4, 1, 0.6, 0.2, 0.8, 0.35, 0.9, 0.5, 0.15]
+function HeartbeatLine({ active }) {
+  if (!active) return <span className="text-[10px] text-gray-700">· · ·</span>
+  return (
+    <div className="flex items-end gap-px h-3.5">
+      {BARS.map((h, i) => (
+        <div
+          key={i}
+          className="w-px bg-accent-green rounded-full pulse-bar"
+          style={{
+            height: `${h * 100}%`,
+            '--dur': `${0.6 + i * 0.1}s`,
+            animationDelay: `${i * 0.07}s`,
+          }}
+        />
+      ))}
     </div>
   )
 }

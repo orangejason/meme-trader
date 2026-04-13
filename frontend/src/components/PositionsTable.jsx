@@ -195,8 +195,19 @@ function BotPositions({ onRefresh }) {
 // ── 单行持仓（带价格闪烁 + PnL进度条） ─────────────────────────
 function PositionRow({ p, loading, onClose }) {
   const flashCls = usePriceFlash(p.current_price)
+  const pnl = p.pnl_pct ?? 0
+  // 行背景：盈利绿色 / 亏损红色，强度随 pnl 大小变化
+  const rowBg = pnl >= 20
+    ? 'bg-green-900/20 border-green-800/20'
+    : pnl >= 5
+    ? 'bg-green-900/10 border-transparent'
+    : pnl <= -20
+    ? 'bg-red-900/20 border-red-800/20'
+    : pnl <= -5
+    ? 'bg-red-900/10 border-transparent'
+    : 'border-transparent'
   return (
-    <tr className="border-b border-dark-700 hover:bg-dark-700/30">
+    <tr className={`border-b border-dark-700 hover:brightness-110 transition-colors ${rowBg}`}>
       <td className="py-2 pr-3">
         <Badge color={CHAIN_COLOR[p.chain] || 'gray'}>{p.chain}</Badge>
       </td>
