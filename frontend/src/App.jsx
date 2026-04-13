@@ -934,43 +934,76 @@ function SignalOverviewCard() {
   const [period, setPeriod] = useState('day')
   const [data, setData] = useState(null)
   const [animKey, setAnimKey] = useState(0)
+  // 实时跳动波形：记录每次刷新时 total 的增量，保留最近 30 个点
+  const [liveWave, setLiveWave] = useState([])
+  const prevTotal = useRef(null)
 
   useEffect(() => {
     let alive = true
+    const load = () => {
+      getSignalOverview(period).then(d => {
+        if (!alive) return
+        setData(prev => {
+          // 计算增量，追加到波形
+          const delta = prev ? Math.max(0, d.total - prev.total) : 0
+          setLiveWave(w => {
+            const next = [...w, delta]
+            return next.length > 30 ? next.slice(-30) : next
+          })
+          if (!prev || d.total !== prev.total) setAnimKey(k => k + 1)
+          return d
+        })
+      }).catch(() => {})
+    }
+    // 首次加载用 series 数据初始化波形
     getSignalOverview(period).then(d => {
       if (!alive) return
       setData(d)
       setAnimKey(k => k + 1)
+      // 用历史 series 的最后 30 个 bucket cnt 初始化波形
+      const init = (d.series || []).slice(-30).map(s => s.cnt)
+      setLiveWave(init)
+      prevTotal.current = d.total
     }).catch(() => {})
-    return () => { alive = false }
+    const t = setInterval(load, 3000)
+    return () => { alive = false; clearInterval(t) }
   }, [period])
 
-  // 迷你折线图（SVG）
-  const MiniChart = ({ series, color }) => {
-    if (!series?.length) return null
-    const vals = series.map(s => s.cnt)
+  // 实时跳动波形 SVG
+  const LiveWave = ({ vals, color }) => {
+    if (!vals?.length) return null
+    const w = 100, h = 40
     const max = Math.max(...vals, 1)
-    const w = 100, h = 36
-    const pts = vals.map((v, i) => {
-      const x = (i / (vals.length - 1 || 1)) * w
-      const y = h - (v / max) * h
-      return `${x},${y}`
-    }).join(' ')
-    const area = `M0,${h} ` + vals.map((v, i) => {
-      const x = (i / (vals.length - 1 || 1)) * w
-      const y = h - (v / max) * h
-      return `L${x},${y}`
-    }).join(' ') + ` L${w},${h} Z`
+    // 平滑曲线用 cubic bezier
+    const points = vals.map((v, i) => ({
+      x: (i / (vals.length - 1 || 1)) * w,
+      y: h - (v / max) * (h - 4) - 2,
+    }))
+    let d = `M ${points[0].x} ${points[0].y}`
+    for (let i = 1; i < points.length; i++) {
+      const p = points[i - 1], c = points[i]
+      const mx = (p.x + c.x) / 2
+      d += ` C ${mx} ${p.y} ${mx} ${c.y} ${c.x} ${c.y}`
+    }
+    const area = d + ` L ${w} ${h} L 0 ${h} Z`
+    // 最后一个点高亮脉冲
+    const last = points[points.length - 1]
     return (
-      <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{ height: 36 }} preserveAspectRatio="none">
+      <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{ height: 40 }} preserveAspectRatio="none">
         <defs>
-          <linearGradient id={`sg-${color}`} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={color} stopOpacity="0.3" />
+          <linearGradient id="lwg" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={color} stopOpacity="0.4" />
             <stop offset="100%" stopColor={color} stopOpacity="0" />
           </linearGradient>
         </defs>
-        <path d={area} fill={`url(#sg-${color})`} />
-        <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+        <path d={area} fill="url(#lwg)" />
+        <path d={d} fill="none" stroke={color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+        {/* 最新点脉冲圆点 */}
+        <circle cx={last.x} cy={last.y} r="2.5" fill={color} opacity="0.9" />
+        <circle cx={last.x} cy={last.y} r="5" fill="none" stroke={color} strokeWidth="1" opacity="0.4">
+          <animate attributeName="r" values="3;8;3" dur="2s" repeatCount="indefinite" />
+          <animate attributeName="opacity" values="0.6;0;0.6" dur="2s" repeatCount="indefinite" />
+        </circle>
       </svg>
     )
   }
@@ -1002,9 +1035,9 @@ function SignalOverviewCard() {
             <div className="text-[11px] text-gray-500">{data.unique_ca} 个币种</div>
           </div>
 
-          {/* 迷你折线图 */}
+          {/* 实时跳动波形 */}
           <div className="flex-1 min-h-0">
-            <MiniChart series={data.series} color="#3b82f6" />
+            <LiveWave vals={liveWave} color="#3b82f6" />
           </div>
 
           {/* 底部指标行 */}
