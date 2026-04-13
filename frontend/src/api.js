@@ -29,3 +29,7 @@ export const sellBatch = (items) => api.post('/positions/sell_batch', { items })
 // 最近信号流
 export const getRecentSignals = (limit = 50) =>
   api.get('/analytics/recent_signals', { params: { limit } }).then(r => r.data)
+
+// 信号总览（MEME币接收统计）
+export const getSignalOverview = (period = 'day') =>
+  api.get('/analytics/signal_overview', { params: { period } }).then(r => r.data)

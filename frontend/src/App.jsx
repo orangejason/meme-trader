@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { getTradeStats, getPositions, getConfig, updateConfig, getTradeHistory, getRecentSignals } from './api'
+import { getTradeStats, getPositions, getConfig, updateConfig, getTradeHistory, getRecentSignals, getSignalOverview } from './api'
 import { useWebSocket } from './hooks/useWebSocket'
 import ConfigPanel from './components/ConfigPanel'
 import { GasAnalysisPanel } from './components/ConfigPanel'
@@ -241,7 +241,10 @@ function Dashboard({ stats, posCount, onRefresh }) {
     <div className="space-y-5">
 
       {/* 1. 统计卡片 */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
+        <div className="col-span-2 md:col-span-1">
+          <SignalOverviewCard />
+        </div>
         <StatCard
           index={0}
           label="总交易次数"
@@ -919,6 +922,109 @@ function SignalFeed() {
             </table>
           </div>
         )
+      )}
+    </div>
+  )
+}
+
+// ── MEME信号总览卡片 ──────────────────────────────────────────────
+const PERIOD_LABELS = { hour: '时', day: '天', week: '周', month: '月', year: '年' }
+
+function SignalOverviewCard() {
+  const [period, setPeriod] = useState('day')
+  const [data, setData] = useState(null)
+  const [animKey, setAnimKey] = useState(0)
+
+  useEffect(() => {
+    let alive = true
+    getSignalOverview(period).then(d => {
+      if (!alive) return
+      setData(d)
+      setAnimKey(k => k + 1)
+    }).catch(() => {})
+    return () => { alive = false }
+  }, [period])
+
+  // 迷你折线图（SVG）
+  const MiniChart = ({ series, color }) => {
+    if (!series?.length) return null
+    const vals = series.map(s => s.cnt)
+    const max = Math.max(...vals, 1)
+    const w = 100, h = 36
+    const pts = vals.map((v, i) => {
+      const x = (i / (vals.length - 1 || 1)) * w
+      const y = h - (v / max) * h
+      return `${x},${y}`
+    }).join(' ')
+    const area = `M0,${h} ` + vals.map((v, i) => {
+      const x = (i / (vals.length - 1 || 1)) * w
+      const y = h - (v / max) * h
+      return `L${x},${y}`
+    }).join(' ') + ` L${w},${h} Z`
+    return (
+      <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{ height: 36 }} preserveAspectRatio="none">
+        <defs>
+          <linearGradient id={`sg-${color}`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={color} stopOpacity="0.3" />
+            <stop offset="100%" stopColor={color} stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        <path d={area} fill={`url(#sg-${color})`} />
+        <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    )
+  }
+
+  return (
+    <div className="bg-dark-800 rounded-xl border border-dark-600 p-3 h-full stat-enter flex flex-col gap-2">
+      {/* 标题 + 时段切换 */}
+      <div className="flex items-start justify-between gap-1">
+        <div className="text-xs text-gray-500 leading-tight">收到MEME信号</div>
+        <div className="flex gap-0.5 shrink-0">
+          {Object.entries(PERIOD_LABELS).map(([k, v]) => (
+            <button
+              key={k}
+              onClick={() => setPeriod(k)}
+              className={clsx(
+                'text-[10px] px-1 py-0.5 rounded transition-colors',
+                period === k ? 'bg-accent-blue/30 text-accent-blue' : 'text-gray-600 hover:text-gray-400'
+              )}
+            >{v}</button>
+          ))}
+        </div>
+      </div>
+
+      {data ? (
+        <>
+          {/* 核心数字 */}
+          <div key={animKey} className="count-roll">
+            <div className="text-2xl font-bold font-mono text-white tabular-nums">{data.total.toLocaleString()}</div>
+            <div className="text-[11px] text-gray-500">{data.unique_ca} 个币种</div>
+          </div>
+
+          {/* 迷你折线图 */}
+          <div className="flex-1 min-h-0">
+            <MiniChart series={data.series} color="#3b82f6" />
+          </div>
+
+          {/* 底部指标行 */}
+          <div className="grid grid-cols-3 gap-1 text-center border-t border-dark-600 pt-1.5">
+            <div>
+              <div className="text-[10px] text-gray-600">过滤通过</div>
+              <div className="text-xs font-mono text-green-400">{data.pass_rate}%</div>
+            </div>
+            <div>
+              <div className="text-[10px] text-gray-600">买入率</div>
+              <div className="text-xs font-mono text-yellow-400">{data.buy_rate}%</div>
+            </div>
+            <div>
+              <div className="text-[10px] text-gray-600">已买入</div>
+              <div className="text-xs font-mono text-accent-blue">{data.bought}</div>
+            </div>
+          </div>
+        </>
+      ) : (
+        <div className="flex-1 flex items-center justify-center text-gray-700 text-xs">加载中...</div>
       )}
     </div>
   )

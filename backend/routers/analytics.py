@@ -19,6 +19,68 @@ def _short_hash(s: str, length: int = 4) -> str:
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
 
+@router.get("/signal_overview")
+async def get_signal_overview(
+    period: str = "day",   # hour | day | week | month | year
+    db: AsyncSession = Depends(get_db),
+):
+    """MEME信号总览：总推送次数、独立CA数、过滤通过率、时序折线数据"""
+    from sqlalchemy import text as _text
+
+    PERIOD_MAP = {
+        "hour":  (timedelta(hours=1),   "%Y-%m-%d %H:%M", 60, timedelta(minutes=1)),
+        "day":   (timedelta(days=1),    "%Y-%m-%d %H",    24, timedelta(hours=1)),
+        "week":  (timedelta(weeks=1),   "%Y-%m-%d",        7, timedelta(days=1)),
+        "month": (timedelta(days=30),   "%Y-%m-%d",       30, timedelta(days=1)),
+        "year":  (timedelta(days=365),  "%Y-%m",          12, timedelta(days=30)),
+    }
+    delta, fmt, buckets, bucket_size = PERIOD_MAP.get(period, PERIOD_MAP["day"])
+    cutoff = datetime.utcnow() - delta
+
+    # 总量统计
+    total_q = await db.execute(
+        select(
+            func.count().label("total"),
+            func.count(func.distinct(CaFeed.ca)).label("unique_ca"),
+            func.sum(func.cast(CaFeed.filter_passed, Integer)).label("passed"),
+            func.sum(func.cast(CaFeed.bought, Integer)).label("bought"),
+        ).where(CaFeed.received_at >= cutoff)
+    )
+    row = total_q.first()
+    total      = row.total or 0
+    unique_ca  = row.unique_ca or 0
+    passed     = int(row.passed or 0)
+    bought_cnt = int(row.bought or 0)
+
+    # 时序折线（按 bucket 聚合推送次数和独立CA）
+    series_q = await db.execute(
+        select(
+            func.strftime(fmt, CaFeed.received_at).label("bucket"),
+            func.count().label("cnt"),
+            func.count(func.distinct(CaFeed.ca)).label("uniq"),
+            func.sum(func.cast(CaFeed.filter_passed, Integer)).label("pass_cnt"),
+        )
+        .where(CaFeed.received_at >= cutoff)
+        .group_by("bucket")
+        .order_by("bucket")
+    )
+    series = [
+        {"t": r.bucket, "cnt": r.cnt, "uniq": r.uniq, "pass": int(r.pass_cnt or 0)}
+        for r in series_q
+    ]
+
+    return {
+        "period": period,
+        "total": total,
+        "unique_ca": unique_ca,
+        "passed": passed,
+        "bought": bought_cnt,
+        "pass_rate": round(passed / total * 100, 1) if total else 0,
+        "buy_rate": round(bought_cnt / total * 100, 1) if total else 0,
+        "series": series,
+    }
+
+
 # ── 漏斗统计 ──────────────────────────────────────────────────────────────────
 @router.get("/funnel")
 async def get_funnel(days: int = 7, db: AsyncSession = Depends(get_db)):
