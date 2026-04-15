@@ -7,7 +7,9 @@ aiosqlite==0.20.0
 python-dotenv==1.0.1
 mnemonic==0.21
 eth-account==0.11.2
+eth-utils
 cryptography
 base58
 pydantic==2.7.1
 pydantic-settings==2.2.1
+solders==0.27.1

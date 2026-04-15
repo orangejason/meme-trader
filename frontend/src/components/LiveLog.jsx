@@ -48,7 +48,7 @@ export default function LiveLog({ logs, connected }) {
           if (!badge) return null
           return (
             <div key={log.id} className="flex gap-2 items-start hover:bg-dark-700 px-1 rounded">
-              <span className="text-gray-600 shrink-0">{log.ts?.slice(11, 19)}</span>
+              <span className="text-gray-600 shrink-0">{log.ts ? new Date(log.ts).toLocaleTimeString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' }) : ''}</span>
               {badge && (
                 <span className={clsx('shrink-0 w-10 text-right', badge.cls)}>{badge.label}</span>
               )}

@@ -23,6 +23,7 @@ _sell_last_reason: dict[int, str] = {}  # pos_id -> 中文原因
 SELL_MAX_CONSECUTIVE_FAIL = 3    # 连续失败 3 次后暂时跳过
 SELL_SKIP_SECONDS = 300          # 跳过 5 分钟后重试
 SELL_ABANDON_FAIL = 20           # 累计失败 20 次（跨多个跳过周期）后放弃，直接关仓
+SELL_ABANDON_SIMULATE_FAIL = 5   # 3025合约模拟失败：累计5次即放弃（不可自愈，继续重试无意义）
 
 
 async def _get_config(session) -> dict:
@@ -100,8 +101,13 @@ async def _sell_position(position: Position, reason: str, current_price: float):
             "sell_reason": reason,
             "fail_count": fail_count,
         }, level="error")
-        broadcaster.log(f"❌ 卖出失败 {position.ca[:12]}... [{position.chain}]: {reason_zh} — {err_str[:100]}", level="error")
-        if fail_count >= SELL_ABANDON_FAIL:
+        broadcaster.log(f"❌ 卖出失败 {position.ca[:12]}... [{position.chain}]: {reason_zh} — {err_str[:180]}", level="error")
+        # 3025 合约模拟失败：不可自愈（代币有限制/貔貅），累计 SELL_ABANDON_SIMULATE_FAIL 次即放弃
+        # Gas 不足：不可自愈（需要手动充值），同样快速放弃，避免持续重试
+        is_simulate_fail = "3025" in err_str or "链上余额为零" in reason_zh
+        is_gas_fail = "主币余额不足" in reason_zh or "not enough bnb" in err_str.lower() or "gas fee" in err_str.lower()
+        abandon_threshold = SELL_ABANDON_SIMULATE_FAIL if (is_simulate_fail or is_gas_fail) else SELL_ABANDON_FAIL
+        if fail_count >= abandon_threshold:
             await _abandon_position(position, reason_zh, fail_count)
             return False
         if fail_count >= SELL_MAX_CONSECUTIVE_FAIL:
@@ -296,6 +302,7 @@ async def _sell_position(position: Position, reason: str, current_price: float):
         "symbol": symbol,
         "logo_url": logo_url,
         "hold_minutes": round((datetime.utcnow() - position.open_time).total_seconds() / 60, 1),
+        "route": result.get("route", "AVE Trade"),
     })
     REASON_ZH = {"take_profit": "止盈", "stop_loss": "止损", "time_limit": "超时", "manual": "手动", "zero_balance": "归零", "sell_failed": "放弃"}
     reason_zh = REASON_ZH.get(reason, reason)
@@ -347,8 +354,36 @@ async def monitor_loop():
 
 
 async def _get_chain_token_balance(ca: str, wallet_address: str, chain: str) -> float:
-    """直接从链上 RPC 查询 EVM 代币余额（使用正确的 decimals）。
+    """直接从链上 RPC 查询代币余额。
     返回实际代币数量；失败返回 -1。"""
+    if chain.upper() == "SOL":
+        # SOL 链：用 getTokenAccountsByOwner 查钱包持有的 token 数量
+        import httpx as _httpx
+        SOL_RPC = "https://api.mainnet-beta.solana.com"
+        try:
+            async with _httpx.AsyncClient(timeout=8.0) as c:
+                r = await c.post(SOL_RPC, json={
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "getTokenAccountsByOwner",
+                    "params": [wallet_address, {"mint": ca}, {"encoding": "jsonParsed"}]
+                })
+                rj = r.json()
+                if rj.get("error"):
+                    return -1
+                accounts = rj.get("result", {}).get("value", [])
+                total_raw = 0
+                decimals = 6
+                for acct in accounts:
+                    info = acct.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                    tok_amt = info.get("tokenAmount", {})
+                    raw = tok_amt.get("amount", "0")
+                    dec = tok_amt.get("decimals", 6)
+                    total_raw += int(raw) if raw else 0
+                    decimals = dec
+                return total_raw / (10 ** decimals)
+        except Exception as e:
+            logger.warning(f"SOL链上余额查询失败 {ca[:12]}: {e}")
+            return -1
     if chain.upper() not in ("BSC", "ETH", "XLAYER"):
         return -1  # 非 EVM 链跳过
     import httpx as _httpx
@@ -381,6 +416,13 @@ async def _check_position(
     stop_loss_pct: float,
     max_hold_minutes: float,
 ):
+    # 跟单持仓优先使用自身保存的止盈止损参数
+    if getattr(pos, 'follow_take_profit', 0) and pos.follow_take_profit > 0:
+        take_profit_pct = pos.follow_take_profit
+    if getattr(pos, 'follow_stop_loss', 0) and pos.follow_stop_loss > 0:
+        stop_loss_pct = pos.follow_stop_loss
+    if getattr(pos, 'follow_max_hold_min', 0) and pos.follow_max_hold_min > 0:
+        max_hold_minutes = float(pos.follow_max_hold_min)
     # 卖出失败过多，暂时跳过
     import time
     skip_until = _sell_skip_until.get(pos.id, 0)
@@ -411,9 +453,15 @@ async def _check_position(
     _check_position._balance_check_ts = _balance_check_last
     now = time.time()
     last_check = _balance_check_last.get(pos.id, 0)
-    # 新建持仓后至少等 60 秒再查余额，避免买入交易刚上链未确认就被误判归零
+    # 新建持仓后至少等 120 秒再查余额：
+    # - SOL 链 getTokenAccountsByOwner 有索引延迟，买入后可能返回空余额
+    # - 即使触发止盈/止损也要等足够时间，避免"买入3秒后归零"误判
     hold_seconds = (datetime.utcnow() - pos.open_time).total_seconds() if pos.open_time else 999
-    should_check_balance = should_sell or (now - last_check > 30 and hold_seconds > 60)
+    balance_check_min_hold = 120  # 至少持仓 120 秒才做归零检测
+    should_check_balance = (
+        (should_sell or now - last_check > 30)
+        and hold_seconds > balance_check_min_hold
+    )
 
     if should_check_balance:
         _balance_check_last[pos.id] = now

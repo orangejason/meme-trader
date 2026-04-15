@@ -14,7 +14,7 @@ for /f "tokens=2" %%i in ('tasklist /fi "imagename eq python.exe" /fo csv /nh 2^
 timeout /t 1 /nobreak >nul
 
 :: 找一个可用端口（从8000开始，跳过被占用的）
-set BACKEND_PORT=8000
+set BACKEND_PORT=9000
 :check_port
 netstat -ano | findstr ":%BACKEND_PORT% " | findstr "LISTENING" >nul 2>&1
 if %errorlevel%==0 (
@@ -23,21 +23,16 @@ if %errorlevel%==0 (
 )
 echo 后端将使用端口: %BACKEND_PORT%
 
-:: 启动后端
+:: 启动后端（同时 serve 前端 dist，无需 Node.js）
 echo 启动后端...
-start "Meme Trader Backend" cmd /k "cd /d "%~dp0backend" && set BACKEND_PORT=%BACKEND_PORT% && python main.py"
+start "Meme Trader" cmd /k "cd /d "%~dp0backend" && set BACKEND_PORT=%BACKEND_PORT% && python main.py"
 
 :: 等待后端启动
 timeout /t 5 /nobreak >nul
 
-:: 启动前端（传入后端端口，vite.config.js 会读取）
-echo 启动前端...
-start "Meme Trader Frontend" cmd /k "cd /d "%~dp0frontend" && set BACKEND_PORT=%BACKEND_PORT% && npm run dev -- --port 5173"
-
 echo.
 echo 启动完成！
-echo   前端: http://localhost:5173
-echo   后端: http://localhost:%BACKEND_PORT%
+echo   访问地址: http://localhost:%BACKEND_PORT%
 echo.
-timeout /t 3 /nobreak >nul
-start http://localhost:5173
+timeout /t 2 /nobreak >nul
+start http://localhost:%BACKEND_PORT%

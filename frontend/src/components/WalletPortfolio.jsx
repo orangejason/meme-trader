@@ -88,7 +88,7 @@ export default function WalletPortfolio() {
           <h3 className="text-sm font-semibold text-gray-200">钱包资产总览</h3>
           {lastUpdated && (
             <div className="text-xs text-gray-500 mt-0.5">
-              更新于 {lastUpdated.toLocaleTimeString()}
+              更新于 {lastUpdated.toLocaleTimeString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' })}
               {data && (
                 <span className="ml-2 text-gray-400">
                   · 持仓估值

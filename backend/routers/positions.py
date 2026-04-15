@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from database import get_db, Position, CaFeed, TokenDetail, AsyncSessionLocal, Trade
+from database import get_db, Position, CaFeed, TokenDetail, AsyncSessionLocal, Trade, SenderStats
 from datetime import datetime
 import json
 import logging
@@ -66,11 +66,37 @@ async def get_open_positions(db: AsyncSession = Depends(get_db)):
     callers_map: dict[str, list] = {}
     if ca_list:
         feeds_result = await db.execute(
-            select(CaFeed.ca, CaFeed.sender, CaFeed.raw_json)
+            select(
+                CaFeed.ca, CaFeed.sender, CaFeed.raw_json,
+                CaFeed.sender_win_rate, CaFeed.sender_group_win_rate,
+            )
             .where(CaFeed.ca.in_(ca_list))
             .order_by(CaFeed.received_at.desc())
         )
-        for row in feeds_result:
+        feeds_rows = list(feeds_result)
+
+        # 收集所有 sender raw 字符串，批量查本地胜率
+        sender_raws_set: set[str] = set()
+        for row in feeds_rows:
+            if row.sender:
+                sender_raws_set.add(row.sender)
+        sender_stats_map: dict[str, SenderStats] = {}
+        if sender_raws_set:
+            stats_result = await db.execute(
+                select(SenderStats).where(SenderStats.sender.in_(sender_raws_set))
+            )
+            sender_stats_map = {s.sender: s for s in stats_result.scalars().all()}
+
+        def _local_win_rate(raw_sender: str):
+            s = sender_stats_map.get(raw_sender)
+            if not s:
+                return None
+            total = (s.win_count or 0) + (s.loss_count or 0)
+            if total == 0:
+                return None
+            return round(s.win_count / total * 100, 1)
+
+        for row in feeds_rows:
             ca = row.ca
             sender_raw = row.sender or ""
             group_raw = ""
@@ -81,7 +107,13 @@ async def get_open_positions(db: AsyncSession = Depends(get_db)):
                 group_raw = raw.get("qun_name", "") or ""
             except Exception:
                 pass
-            entry = {"s": _hash(sender_raw), "g": _hash(group_raw)}
+            entry = {
+                "s": _hash(sender_raw),
+                "g": _hash(group_raw),
+                "sw": round(float(row.sender_win_rate or 0), 1),
+                "gw": round(float(row.sender_group_win_rate or 0), 1),
+                "sl": _local_win_rate(sender_raw),
+            }
             if ca not in callers_map:
                 callers_map[ca] = []
             if len(callers_map[ca]) < 3:

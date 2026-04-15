@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { getPositions, closePosition, getWalletBalances, sellBatch } from '../api'
+import { getPositions, closePosition, getWalletBalances, sellBatch, getConfig } from '../api'
 import { Card, Badge, PnlValue, Button } from './UI'
 import { clsx } from 'clsx'
 
@@ -126,6 +126,8 @@ export default function PositionsTable({ onRefresh }) {
 function BotPositions({ onRefresh }) {
   const [positions, setPositions] = useState([])
   const [loading, setLoading] = useState(false)
+  const [tp, setTp] = useState(50)
+  const [sl, setSl] = useState(30)
 
   const load = useCallback(async () => {
     try {
@@ -139,6 +141,13 @@ function BotPositions({ onRefresh }) {
     const t = setInterval(load, 5000)
     return () => clearInterval(t)
   }, [load])
+
+  useEffect(() => {
+    getConfig().then(cfg => {
+      if (cfg.take_profit_pct) setTp(parseFloat(cfg.take_profit_pct))
+      if (cfg.stop_loss_pct)   setSl(parseFloat(cfg.stop_loss_pct))
+    }).catch(() => {})
+  }, [])
 
   const handleClose = async (id) => {
     if (!confirm('确认手动卖出此持仓？')) return
@@ -172,18 +181,20 @@ function BotPositions({ onRefresh }) {
                 <th className="text-left py-2 pr-3">链</th>
                 <th className="text-left py-2 pr-3">代币</th>
                 <th className="text-right py-2 pr-3">买入价</th>
+                <th className="text-center py-2 pr-2 text-[10px]">喊单人/社区</th>
+                <th className="text-center py-2 pr-2 text-[10px]">WS胜率</th>
+                <th className="text-right py-2 pr-3 text-[10px]">本地胜率</th>
                 <th className="text-right py-2 pr-3">Gas(U)</th>
                 <th className="text-right py-2 pr-3">当前价</th>
                 <th className="text-right py-2 pr-3">持仓(U)</th>
                 <th className="text-right py-2 pr-3">P&amp;L</th>
                 <th className="text-right py-2 pr-3">持仓时间</th>
-                <th className="text-center py-2 pr-3">喊单</th>
                 <th className="text-right py-2"></th>
               </tr>
             </thead>
             <tbody>
               {positions.map(p => (
-                <PositionRow key={p.id} p={p} loading={loading} onClose={handleClose} />
+                <PositionRow key={p.id} p={p} loading={loading} onClose={handleClose} tp={tp} sl={sl} />
               ))}
             </tbody>
           </table>
@@ -193,35 +204,52 @@ function BotPositions({ onRefresh }) {
   )
 }
 
-// ── 喊单编号常驻显示（扫光动效） ──────────────────────────────────
-function CallerBadges({ callers }) {
-  if (!callers?.length) return <span className="text-gray-700 text-[10px]">—</span>
-  return (
-    <div className="flex flex-col gap-0.5 items-start">
-      {callers.map((c, i) => (
-        <div key={i} className="flex gap-0.5 flex-wrap">
-          {c.g && (
-            <span
-              className="relative overflow-hidden text-blue-300 bg-blue-900/30 border border-blue-800/40 px-1.5 py-0.5 rounded text-[10px] font-mono leading-none"
-              style={{ animationDelay: `${i * 0.4}s` }}
-            >
-              <span className="shimmer-line" />
-              {c.g}
-            </span>
-          )}
-          {c.s && (
-            <span
-              className="relative overflow-hidden text-orange-300 bg-orange-900/30 border border-orange-800/40 px-1.5 py-0.5 rounded text-[10px] font-mono leading-none"
-              style={{ animationDelay: `${i * 0.4 + 0.2}s` }}
-            >
-              <span className="shimmer-line" />
-              {c.s}
-            </span>
-          )}
-        </div>
-      ))}
-    </div>
-  )
+// ── 喊单信息列（喊单人/社区 MD5、WS胜率、本地胜率） ──────────────
+function rateColor(v) {
+  if (v == null || v === 0) return 'text-gray-600'
+  if (v >= 60) return 'text-green-400'
+  if (v >= 40) return 'text-yellow-400'
+  return 'text-red-400'
+}
+
+function CallerInfo({ callers, field }) {
+  const c = callers?.[0]
+  if (!c) return <span className="text-gray-700 text-[10px]">—</span>
+
+  if (field === 'id') {
+    return (
+      <div className="flex flex-col gap-0.5 items-center">
+        {c.g && (
+          <span className="relative overflow-hidden text-blue-300 bg-blue-900/30 border border-blue-800/40 px-1.5 py-0.5 rounded text-[10px] font-mono leading-none">
+            <span className="shimmer-line" />{c.g}
+          </span>
+        )}
+        {c.s && (
+          <span className="relative overflow-hidden text-orange-300 bg-orange-900/30 border border-orange-800/40 px-1.5 py-0.5 rounded text-[10px] font-mono leading-none">
+            <span className="shimmer-line" />{c.s}
+          </span>
+        )}
+        {!c.g && !c.s && <span className="text-gray-700 text-[10px]">—</span>}
+      </div>
+    )
+  }
+  if (field === 'wr') {
+    return (
+      <div className="flex flex-col gap-0.5 items-center font-mono text-[10px]">
+        <span className={rateColor(c.gw)} title="社区WS胜率">{c.gw > 0 ? c.gw + '%' : '—'}</span>
+        <span className={rateColor(c.sw)} title="喊单人WS胜率">{c.sw > 0 ? c.sw + '%' : '—'}</span>
+      </div>
+    )
+  }
+  if (field === 'local') {
+    const val = c.sl
+    return (
+      <span className={`font-mono text-[10px] ${val != null ? rateColor(val) : 'text-gray-600'}`} title="本地实际胜率">
+        {val != null ? val + '%' : '—'}
+      </span>
+    )
+  }
+  return null
 }
 
 // ── 实时毫秒计时器 ────────────────────────────────────────────────
@@ -249,17 +277,36 @@ function LiveTimer({ openTime }) {
 }
 
 // ── 卖出进度按钮（接近止盈/止损时脉冲） ────────────────────────────
-function SellButton({ pnl, loading, onClick }) {
-  const stopLoss = 30
-  const takeProfit = 50
-  const urgency = pnl <= -(stopLoss * 0.7) || pnl >= (takeProfit * 0.7)  // 达到70%阈值开始脉冲
+function SellButton({ pnl, loading, onClick, tp = 50, sl = 30 }) {
+  // 距离阈值的百分比（0~100）
   const pct = pnl >= 0
-    ? Math.min(pnl / takeProfit * 100, 100)
-    : Math.min(Math.abs(pnl) / stopLoss * 100, 100)
+    ? Math.min(pnl / tp * 100, 100)
+    : Math.min(Math.abs(pnl) / sl * 100, 100)
+
+  // 状态判断
+  const nearTP = pnl >= tp * 0.7   // 达到止盈阈值 70%
+  const hitTP  = pnl >= tp          // 已触发止盈
+  const nearSL = pnl <= -(sl * 0.7) // 达到止损阈值 70%
+  const hitSL  = pnl <= -sl         // 已触发止损
+
+  const label = hitTP  ? '即将止盈卖出'
+              : hitSL  ? '即将止损卖出'
+              : nearTP ? '接近止盈'
+              : nearSL ? '接近止损'
+              : '卖出'
+
   const color = pnl >= 0 ? '#00ff87' : '#ff4466'
+
+  // 按钮样式
+  const btnCls = hitTP  ? 'bg-green-500 hover:bg-green-400 text-white sell-pulse shadow-[0_0_8px_rgba(0,255,135,0.5)]'
+               : hitSL  ? 'bg-red-500 hover:bg-red-400 text-white sell-pulse shadow-[0_0_8px_rgba(255,68,102,0.5)]'
+               : nearTP ? 'bg-green-700/80 hover:bg-green-600 text-green-100'
+               : nearSL ? 'bg-red-700/80 hover:bg-red-600 text-red-100'
+               : 'bg-accent-red/70 hover:bg-accent-red text-white'
+
   return (
     <div className="flex flex-col items-end gap-1">
-      {/* 进度弧形指示 */}
+      {/* 进度条 */}
       <div className="relative w-10 h-1.5 bg-dark-600 rounded-full overflow-hidden">
         <div
           className="absolute left-0 top-0 h-full rounded-full transition-all duration-1000"
@@ -270,18 +317,16 @@ function SellButton({ pnl, loading, onClick }) {
         disabled={loading}
         onClick={onClick}
         className={clsx(
-          'px-2 py-1 text-xs rounded-lg font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed',
-          urgency
-            ? 'bg-accent-red text-white sell-pulse'
-            : 'bg-accent-red/70 hover:bg-accent-red text-white'
+          'px-2 py-1 text-xs rounded-lg font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap',
+          btnCls
         )}
-      >卖出</button>
+      >{loading ? '...' : label}</button>
     </div>
   )
 }
 
 // ── 单行持仓（带价格闪烁 + PnL进度条） ─────────────────────────
-function PositionRow({ p, loading, onClose }) {
+function PositionRow({ p, loading, onClose, tp = 50, sl = 30 }) {
   const flashCls = usePriceFlash(p.current_price)
   const pnl = p.pnl_pct ?? 0
   const rowBg = pnl >= 20
@@ -302,6 +347,15 @@ function PositionRow({ p, loading, onClose }) {
         <TokenCell logo_url={p.logo_url} token_name={p.token_name} symbol={p.symbol} ca={p.ca} />
       </td>
       <td className="text-right py-2 pr-3 font-mono text-gray-400">{fmtPrice(p.entry_price)}</td>
+      <td className="text-center py-2 pr-2">
+        <CallerInfo callers={p.callers} field="id" />
+      </td>
+      <td className="text-center py-2 pr-2">
+        <CallerInfo callers={p.callers} field="wr" />
+      </td>
+      <td className="text-right py-2 pr-3">
+        <CallerInfo callers={p.callers} field="local" />
+      </td>
       <td className="text-right py-2 pr-3 font-mono text-orange-400/80">
         {p.gas_fee_usd > 0 ? p.gas_fee_usd.toFixed(4) : '—'}
       </td>
@@ -319,11 +373,8 @@ function PositionRow({ p, loading, onClose }) {
       <td className="text-right py-2 pr-3 text-gray-500 font-mono tabular-nums">
         <LiveTimer openTime={p.open_time} />
       </td>
-      <td className="text-center py-2 pr-3">
-        <CallerBadges callers={p.callers} />
-      </td>
       <td className="text-right py-2">
-        <SellButton pnl={pnl} loading={loading} onClick={() => onClose(p.id)} />
+        <SellButton pnl={pnl} loading={loading} onClick={() => onClose(p.id)} tp={tp} sl={sl} />
       </td>
     </tr>
   )

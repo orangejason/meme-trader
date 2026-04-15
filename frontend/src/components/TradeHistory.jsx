@@ -135,7 +135,7 @@ export default function TradeHistory() {
                       <span className="text-[10px]">{r.icon}</span>
                       <Badge color={r.color}>{r.label}</Badge>
                     </td>
-                    <td className="text-right py-2 text-gray-500">{t.close_time?.slice(0, 16).replace('T', ' ')}</td>
+                    <td className="text-right py-2 text-gray-500">{t.close_time ? new Date(t.close_time).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : ''}</td>
                   </tr>
                 )
               })}

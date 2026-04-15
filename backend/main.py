@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 
 from database import init_db
-from routers import config, positions, trades, ws, wallet, analytics
+from routers import config, positions, trades, ws, wallet, analytics, ai_chat, admin
 from services.broadcaster import broadcaster
 
 logging.basicConfig(
@@ -82,6 +82,8 @@ app.include_router(trades.router)
 app.include_router(ws.router)
 app.include_router(wallet.router)
 app.include_router(analytics.router)
+app.include_router(ai_chat.router)
+app.include_router(admin.router)
 
 
 @app.post("/api/sweep")

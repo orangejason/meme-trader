@@ -28,21 +28,26 @@ CHAIN_NAME_MAP = {
 }
 
 # 各链买入时使用的 inToken
-# Solana 用 SOL（文档: SOL传参"sol"），EVM 用 USDT
+# Solana 用 Wrapped SOL mint 地址（AVE createSolanaTx 不接受 "sol" 字符串）
+# EVM 用 USDT
 BUY_IN_TOKEN = {
     "bsc":     "0x55d398326f99059fF775485246999027B3197955",  # USDT BEP20
     "eth":     "0xdAC17F958D2ee523a2206206994597C13D831ec7",  # USDT ERC20
-    "solana":  "sol",   # AVE 文档: SOL 传 "sol"
+    "solana":  "sol",   # AVE Solana 接口规定传 "sol"
     "base":    "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",  # USDC on Base
 }
 
-# 卖出时 outToken（收到的代币）
-# Four.meme 内盘代币只支持卖出为主链币，所以统一用主链币地址
-# 主链币用 0xeeee...eeee 表示（EVM 惯例）
+# 各链原生币（BNB/ETH）地址（用于 BNB 回退买入模式）
+BUY_NATIVE_TOKEN = {
+    "bsc": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",  # BNB
+    "eth": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",  # ETH
+}
+# 原生币 decimals（BNB/ETH 均为 18）
+BUY_NATIVE_DECIMALS = {"bsc": 18, "eth": 18}
 SELL_OUT_TOKEN = {
     "bsc":     "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",  # BNB
     "eth":     "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",  # ETH
-    "solana":  "sol",
+    "solana":  "sol",   # AVE Solana 接口规定传 "sol"
     "base":    "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",  # ETH on Base
 }
 
@@ -73,13 +78,16 @@ async def _get_native_price_usd_async(chain_name: str) -> float:
     fallback = _NATIVE_PRICE_FALLBACK.get(chain_name, 600.0)
 
     # 用 AVE getAmountOut: 1个主链币 → USDT，反推主链币/USDT价格
+    # SOL 链用 Solana getAmountOut: 1 SOL(1e9 lamports) → USDC(EPjFWdd5...)
     NATIVE_TO_USDT = {
-        "bsc":  ("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-                 "0x55d398326f99059fF775485246999027B3197955", 18, 18),  # BNB→USDT(18dec)
-        "eth":  ("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-                 "0xdAC17F958D2ee523a2206206994597C13D831ec7", 18, 6),   # ETH→USDT(6dec)
-        "base": ("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-                 "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", 18, 6),   # ETH→USDC(6dec)
+        "bsc":    ("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                   "0x55d398326f99059fF775485246999027B3197955", 18, 18),  # BNB→USDT(18dec)
+        "eth":    ("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                   "0xdAC17F958D2ee523a2206206994597C13D831ec7", 18, 6),   # ETH→USDT(6dec)
+        "base":   ("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                   "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", 18, 6),   # ETH→USDC(6dec)
+        "solana": ("sol",
+                   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 9, 6),  # SOL→USDC(6dec)
     }
     pair = NATIVE_TO_USDT.get(chain_name)
     if not pair:
@@ -160,7 +168,7 @@ _approved_cache: set[tuple[int, str, str]] = set()
 
 
 async def _get_gas_cfg() -> dict:
-    """从 DB 读取 GAS 配置，返回 {gas_price_multiplier, approve_gas_multiplier}"""
+    """从 DB 读取 GAS 配置，返回 {gas_price_multiplier, approve_gas_multiplier, broadcast_mode}"""
     try:
         from database import AsyncSessionLocal, ConfigModel
         from sqlalchemy import select
@@ -169,6 +177,7 @@ async def _get_gas_cfg() -> dict:
                 ConfigModel.key.in_([
                     "gas_price_multiplier",
                     "approve_gas_price_gwei",
+                    "broadcast_mode",
                 ])
             ))
             return {r.key: r.value for r in result.scalars().all()}
@@ -255,7 +264,11 @@ class AveClient:
         body = resp.json()
         data = body.get("data", {})
         if not data:
+            status = body.get("status", "")
+            msg = body.get("msg", "")
             logger.error(f"createEvmTx empty data: {body}")
+            # 把 AVE 返回的具体原因附到异常上，供上层分类
+            raise ValueError(f"createEvmTx failed: status={status} msg={msg}")
         return data
 
     # ── 发送签名后的 EVM 交易 ──────────────────────────────────────────────────
@@ -284,6 +297,57 @@ class AveClient:
         data = body.get("data", {}) or {}
         return data
 
+    async def _broadcast_evm_tx_direct(self, signed_hex: str, chain_id: int) -> dict:
+        """直接广播模式：跳过 AVE sendSignedEvmTx，用 eth_sendRawTransaction 直接上链。
+
+        优点：gasPrice 不受 AVE 模拟 ≥1 Gwei 限制，可跟随实际网络价格（BSC 约 0.07-1 Gwei）。
+        缺点：无 AVE MEV 保护，无模拟预检（失败直接上链消耗 gas）。
+        返回: {"txHash": str}
+        """
+        import httpx as _httpx
+        import asyncio as _asyncio
+        RPC_MAP = {
+            56:   "https://bsc-dataseed1.binance.org",
+            1:    "https://ethereum-rpc.publicnode.com",
+            8453: "https://mainnet.base.org",
+        }
+        rpc = RPC_MAP.get(chain_id, "https://bsc-dataseed1.binance.org")
+        raw = signed_hex if signed_hex.startswith("0x") else "0x" + signed_hex
+        async with _httpx.AsyncClient(timeout=15.0) as c:
+            r = await c.post(rpc, json={"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":[raw],"id":1})
+            rj = r.json()
+            if "error" in rj:
+                err_obj = rj["error"]
+                err_msg = err_obj.get("message", str(err_obj)) if isinstance(err_obj, dict) else str(err_obj)
+                # already known: 同一笔 tx 已在 mempool，不是真正失败，等待其上链即可
+                if "already known" in err_msg.lower():
+                    from eth_utils import keccak
+                    tx_hash = "0x" + keccak(hexstr=raw).hex()
+                    logger.info(f"already known：tx 已在 mempool，等待确认: txHash={tx_hash}")
+                else:
+                    raise ValueError(f"eth_sendRawTransaction 失败: {err_obj}")
+            else:
+                tx_hash = rj.get("result", "")
+                if not tx_hash:
+                    raise ValueError("eth_sendRawTransaction 返回空 txHash")
+                logger.info(f"直接广播已发送: txHash={tx_hash}，等待链上确认...")
+
+        # 等待 receipt，最多 60 秒（BSC 出块 ~3s）
+        async with _httpx.AsyncClient(timeout=10.0) as c:
+            for _ in range(20):
+                await _asyncio.sleep(3)
+                r2 = await c.post(rpc, json={"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":[tx_hash],"id":1})
+                receipt = r2.json().get("result")
+                if receipt:
+                    status = receipt.get("status", "0x0")
+                    if status == "0x1":
+                        logger.info(f"直接广播确认成功: txHash={tx_hash}")
+                        return {"txHash": tx_hash}
+                    else:
+                        raise ValueError(f"直接广播 TX revert: txHash={tx_hash} status={status}")
+        logger.warning(f"直接广播 60s 未确认，继续处理: txHash={tx_hash}")
+        return {"txHash": tx_hash}
+
     # ── 构造 Solana 交易 ───────────────────────────────────────────────────────
     async def _create_solana_tx(
         self,
@@ -296,6 +360,7 @@ class AveClient:
         fee_lamports: str = "100000",
     ) -> dict:
         client = await self._get_client()
+        logger.info(f"createSolanaTx params: creator={creator_address} inToken={in_token} outToken={out_token} inAmount={in_amount_raw}")
         resp = await client.post("/v1/thirdParty/chainWallet/createSolanaTx", json={
             "creatorAddress": creator_address,
             "inAmount": in_amount_raw,
@@ -308,7 +373,13 @@ class AveClient:
             "autoSlippage": True,
         })
         resp.raise_for_status()
-        return resp.json().get("data", {})
+        body = resp.json()
+        data = body.get("data") or {}
+        if not data:
+            biz_status = body.get("status", "")
+            biz_msg = body.get("msg", "") or body.get("message", "")
+            raise ValueError(f"createSolanaTx 失败: status={biz_status} msg={biz_msg} body={str(body)[:200]}")
+        return data
 
     # ── 发送签名后的 Solana 交易 ───────────────────────────────────────────────
     async def _send_signed_solana_tx(
@@ -338,6 +409,7 @@ class AveClient:
         chain_id: int,
         gas_multiplier: float = 1.2,
         nonce: int = -1,
+        direct_broadcast: bool = False,
     ) -> str:
         """用 eth_account 签名 EVM 交易，返回签名后的 hex。
 
@@ -346,6 +418,7 @@ class AveClient:
         - value: 十进制字符串 "0" 或 "1000000..."
         - nonce: 若 >= 0 则直接使用（由 _alloc_nonce 预先分配），否则临时查链上
         - gas_multiplier: gasPrice 倍数（可配置，影响打包速度）
+        - direct_broadcast: True 时用真实网络 gasPrice，不受 AVE 模拟最低限制
         """
         from eth_account import Account
         from eth_utils import to_checksum_address
@@ -367,9 +440,9 @@ class AveClient:
 
         # 若调用方未预分配 nonce，则临时查链上（单笔场景下无并发问题）
         if nonce < 0:
-            nonce, gas_price = self._fetch_nonce_and_gas(private_key, chain_id, multiplier=gas_multiplier)
+            nonce, gas_price = self._fetch_nonce_and_gas(private_key, chain_id, multiplier=gas_multiplier, direct_broadcast=direct_broadcast)
         else:
-            _, gas_price = self._fetch_nonce_and_gas(private_key, chain_id, multiplier=gas_multiplier)
+            _, gas_price = self._fetch_nonce_and_gas(private_key, chain_id, multiplier=gas_multiplier, direct_broadcast=direct_broadcast)
 
         tx = {
             "to":       to_addr,
@@ -395,10 +468,13 @@ class AveClient:
         private_key: str,
         chain_id: int,
         multiplier: float = 1.2,
+        direct_broadcast: bool = False,
     ) -> tuple[int, int]:
         """同步查询链上 nonce 和 gasPrice（在签名前调用，无需 async）
 
         multiplier: gasPrice 倍数（1.0=不加速, 1.2=20%溢价, 2.0=加速）
+        direct_broadcast: True=直接广播模式，使用实际网络 gasPrice（可低至 0.05 Gwei）
+                          False=AVE 广播模式，强制 ≥1 Gwei（AVE 模拟要求）
         """
         import httpx as _httpx
         from eth_account import Account as _Account
@@ -411,11 +487,17 @@ class AveClient:
             8453: "https://mainnet.base.org",
         }
         # 各链最低可接受 gasPrice（wei）
-        # BSC 网络实际 gas 有时低至 0.05 Gwei，但 AVE 模拟要求至少 1 Gwei
+        # AVE sendSignedEvmTx 模拟要求 BSC ≥ 1 Gwei；直接广播模式无此限制（可低至 0.05 Gwei）
         MIN_GAS_PRICE = {
-            56:    1_000_000_000,   # BSC  最低 1 Gwei（AVE 模拟要求）
+            56:    1_000_000_000,   # BSC  最低 1 Gwei（AVE 模拟要求；直接广播模式可不受此限）
             1:     1_000_000_000,   # ETH  最低 1 Gwei
             8453:     50_000_000,   # Base 最低 0.05 Gwei
+        }
+        # 直接广播模式的最低 gasPrice（跟随实际网络，无 AVE 模拟限制）
+        MIN_GAS_PRICE_DIRECT = {
+            56:      50_000_000,    # BSC  最低 0.05 Gwei（实测网络最低）
+            1:    1_000_000_000,    # ETH  最低 1 Gwei
+            8453:    50_000_000,    # Base 最低 0.05 Gwei
         }
         # 默认 gasPrice（RPC 查询失败时使用；正常情况跟随 RPC 返回值）
         DEFAULT_GAS_PRICE = {
@@ -425,7 +507,7 @@ class AveClient:
         }
 
         rpc_url = RPC.get(chain_id, "https://bsc-dataseed1.binance.org")
-        min_gp  = MIN_GAS_PRICE.get(chain_id, 1_000_000_000)
+        min_gp  = MIN_GAS_PRICE_DIRECT.get(chain_id, 50_000_000) if direct_broadcast else MIN_GAS_PRICE.get(chain_id, 1_000_000_000)
         def_gp  = DEFAULT_GAS_PRICE.get(chain_id, 3_000_000_000)
 
         try:
@@ -436,13 +518,14 @@ class AveClient:
                 gas_price = int(r2.json()["result"], 16)
                 # 低于最低值时用默认值
                 if gas_price < min_gp:
-                    gas_price = def_gp
+                    gas_price = def_gp if not direct_broadcast else min_gp
                 # 乘以可配置倍数（跟随网络行情 + 溢价）
                 gas_price = int(gas_price * multiplier)
                 # 乘完后再次保证不低于链最低值
                 if gas_price < min_gp:
                     gas_price = min_gp
-                logger.info(f"RPC nonce={nonce} gasPrice={gas_price} ({gas_price/1e9:.2f}Gwei) chain={chain_id} addr={address[:10]}...")
+                mode_tag = "直接广播" if direct_broadcast else "AVE广播"
+                logger.info(f"RPC nonce={nonce} gasPrice={gas_price} ({gas_price/1e9:.2f}Gwei) chain={chain_id} addr={address[:10]}... [{mode_tag}]")
                 return nonce, gas_price
         except Exception as e:
             logger.warning(f"RPC query failed ({e}), using defaults")
@@ -465,11 +548,15 @@ class AveClient:
         rpc_url = RPC.get(chain_id, "https://bsc-dataseed1.binance.org")
 
         async with _nonce_locks[chain_id]:
-            # 异步查链上 pending nonce（不阻塞事件循环，Lock 才能真正起效）
+            # 同时查 latest 和 pending，取较大值作为链上 nonce
+            # pending 在重启后可能已过时（上次 pending tx 早已上链），latest 更可靠
             try:
                 async with _httpx.AsyncClient(timeout=8.0) as c:
-                    r = await c.post(rpc_url, json={"jsonrpc":"2.0","method":"eth_getTransactionCount","params":[address,"pending"],"id":1})
-                    nonce_chain = int(r.json()["result"], 16)
+                    r_latest = await c.post(rpc_url, json={"jsonrpc":"2.0","method":"eth_getTransactionCount","params":[address,"latest"],"id":1})
+                    r_pending = await c.post(rpc_url, json={"jsonrpc":"2.0","method":"eth_getTransactionCount","params":[address,"pending"],"id":2})
+                    nonce_latest  = int(r_latest.json()["result"], 16)
+                    nonce_pending = int(r_pending.json()["result"], 16)
+                    nonce_chain = max(nonce_latest, nonce_pending)
             except Exception as e:
                 logger.warning(f"_alloc_nonce RPC failed: {e}, using local fallback")
                 nonce_chain = _nonce_local.get(chain_id, 0)
@@ -485,19 +572,40 @@ class AveClient:
             return nonce
 
     def _sign_solana_tx(self, tx_b64: str, private_key_bytes: bytes) -> str:
-        """用 solders 签名 Solana 交易，返回签名后 Base64
+        """签名 AVE createSolanaTx 返回的 Solana 交易
 
-        AVE 返回的 txContent 是完整的 VersionedTransaction（含空签名占位符）。
-        用 solders 反序列化后重新签名，再序列化回 Base64。
+        AVE txContent 格式：[0x80=version][MessageV0 bytes]（不含签名槽位）
+        正确签名方式：sign(raw[0:])（对完整原始字节签名，包含 0x80 前缀）
+        然后构建标准 VersionedTransaction: [compact-u16=0x01][sig64][0x80][message]
         """
         from solders.keypair import Keypair
-        from solders.transaction import VersionedTransaction
         import base64 as b64
-        kp = Keypair.from_bytes(private_key_bytes)
-        raw = b64.b64decode(tx_b64)
-        tx = VersionedTransaction.from_bytes(raw)
-        signed_tx = VersionedTransaction(tx.message, [kp])
-        return b64.b64encode(bytes(signed_tx)).decode()
+
+        if len(private_key_bytes) == 32:
+            kp = Keypair.from_seed(private_key_bytes)
+        elif len(private_key_bytes) == 64:
+            kp = Keypair.from_bytes(private_key_bytes)
+        else:
+            raise ValueError(f"SOL 私钥长度异常: {len(private_key_bytes)} 字节（期望 32 或 64）")
+
+        # 修复 base64 padding
+        padded = tx_b64 + '=' * (4 - len(tx_b64) % 4) if len(tx_b64) % 4 else tx_b64
+        raw = b64.b64decode(padded)
+        if not raw:
+            raise ValueError("SOL txContent 为空")
+
+        logger.info(f"_sign_solana_tx: raw={len(raw)}B, first=0x{raw[0]:02x}")
+
+        # 对完整 raw 字节签名（包含 0x80 version 前缀）
+        sig = kp.sign_message(raw)
+        sig_bytes = bytes(sig)
+
+        # 构建标准 VersionedTransaction 序列化:
+        # [compact-u16=0x01 表示1个签名][64字节签名][原始raw(含0x80+message)]
+        signed_raw = bytes([0x01]) + sig_bytes + raw
+        result = b64.b64encode(signed_raw).decode()
+        logger.info(f"_sign_solana_tx: 签名成功, signed={len(result)}chars")
+        return result
 
     # ── 公开接口：buy ──────────────────────────────────────────────────────────
     async def buy(
@@ -509,7 +617,10 @@ class AveClient:
     ) -> dict:
         """
         买入代币（链钱包，用户自签名）
-        amount_usdt: EVM 链 = USDT 数量；Solana = SOL 数量
+        amount_usdt: 统一传 USDT 金额，内部自动按链换算：
+          - BSC/ETH：直接用 USDT 买，amount_usdt 即 USDT 数量
+          - BASE/XLAYER：用 USDC 买，USDC ≈ 1:1 USDT，amount_usdt 即 USDC 数量
+          - SOL：用 SOL 买，amount_usdt / sol_price → SOL 数量（实时换算，60s缓存）
         返回: {"success": bool, "tx": str, "token_amount": float, "price": float}
         """
         from services.wallet_manager import wallet_manager
@@ -519,9 +630,58 @@ class AveClient:
         if not in_token:
             raise ValueError(f"不支持的链: {chain}")
 
-        # inToken → 最小精度
+        # ── 各链换算买入数量 ───────────────────────────────────────
         decimals = BUY_IN_DECIMALS.get(chain_name, 18)
-        in_amount_raw = str(int(amount_usdt * (10 ** decimals)))
+
+        if chain_name == "solana":
+            # SOL 链：amount_usdt(U) / sol_price → SOL 数量
+            sol_price = await _get_native_price_usd_async("solana")
+            sol_amount = amount_usdt / sol_price
+            logger.info(f"SOL buy: {amount_usdt}U / {sol_price:.2f}USD = {sol_amount:.6f} SOL")
+            in_amount_raw = str(int(sol_amount * (10 ** decimals)))
+        else:
+            # BSC/ETH：直接用 USDT；BASE/XLAYER：直接用 USDC（≈1U）
+            in_amount_raw = str(int(amount_usdt * (10 ** decimals)))
+
+        # ── BNB/ETH 回退模式：USDT 不足时自动换成原生币买入（仅 BSC/ETH） ───────
+        using_native_fallback = False
+        if chain_name in BUY_NATIVE_TOKEN:
+            try:
+                bnb_fallback_enabled = False
+                from database import AsyncSessionLocal as _ASL, ConfigModel as _CM
+                from sqlalchemy import select as _sel
+                async with _ASL() as _sess:
+                    _row = (await _sess.execute(_sel(_CM).where(_CM.key == "buy_with_bnb_fallback_enabled"))).scalar_one_or_none()
+                    if _row and _row.value.lower() == "true":
+                        bnb_fallback_enabled = True
+                if bnb_fallback_enabled:
+                    # 查 USDT 余额
+                    import httpx as _httpx_fb
+                    RPC_FB = {"bsc": "https://bsc-dataseed1.binance.org", "eth": "https://ethereum-rpc.publicnode.com"}
+                    rpc_fb = RPC_FB.get(chain_name, "https://bsc-dataseed1.binance.org")
+                    addr_padded = wallet_address[2:].zfill(64) if wallet_address.startswith("0x") else wallet_address.zfill(64)
+                    async with _httpx_fb.AsyncClient(timeout=6.0) as _hc:
+                        _r = await _hc.post(rpc_fb, json={"jsonrpc":"2.0","method":"eth_call",
+                            "params":[{"to": in_token, "data": "0x70a08231" + addr_padded}, "latest"],"id":1})
+                        bal_hex = _r.json().get("result", "0x0") or "0x0"
+                        usdt_bal_raw = int(bal_hex, 16) if bal_hex and bal_hex != "0x" else 0
+                    need_raw = int(in_amount_raw) * 95 // 100  # 允许5%误差
+                    if usdt_bal_raw < need_raw:
+                        # USDT 不足 → 切换到原生币
+                        native_price = await _get_native_price_usd_async(chain_name)
+                        native_decimals = BUY_NATIVE_DECIMALS[chain_name]
+                        native_amount = amount_usdt / native_price
+                        native_amount_raw = str(int(native_amount * (10 ** native_decimals)))
+                        usdt_bal_u = usdt_bal_raw / (10 ** decimals)
+                        logger.info(
+                            f"BNB fallback: USDT余额 {usdt_bal_u:.4f}U < 需要 {amount_usdt}U，"
+                            f"切换BNB: {native_amount:.6f} BNB (≈{amount_usdt}U @ {native_price:.2f})"
+                        )
+                        in_token = BUY_NATIVE_TOKEN[chain_name]
+                        in_amount_raw = native_amount_raw
+                        using_native_fallback = True
+            except Exception as _fb_e:
+                logger.warning(f"BNB fallback 检查失败，继续用USDT: {_fb_e}")
 
         try:
             if chain_name == "solana":
@@ -532,7 +692,8 @@ class AveClient:
             else:
                 return await self._buy_evm(
                     ca, chain, chain_name, in_amount_raw, in_token,
-                    wallet_address, wallet_manager
+                    wallet_address, wallet_manager,
+                    skip_approve=using_native_fallback,
                 )
         except Exception as e:
             logger.error(f"Buy error: {e}")
@@ -628,8 +789,33 @@ class AveClient:
             r2 = c.post(rpc_url, json={"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":[raw_hex],"id":2})
             r2j = r2.json()
             if "error" in r2j:
-                raise ValueError(f"approve tx failed: {r2j['error']}")
-            approve_tx_hash = r2j.get("result","")
+                err_msg = str(r2j['error'])
+                # nonce too low：链上 nonce 比本地分配的高（重启后 local 被清空导致）
+                # → 从链上重查 latest nonce 修正本地状态，重新签名重试一次
+                if "nonce too low" in err_msg.lower() or "nonce" in err_msg.lower():
+                    logger.warning(f"approve nonce too low (nonce={nonce})，重查链上 nonce 并重试")
+                    try:
+                        with _httpx.Client(timeout=8.0) as cc:
+                            r_nc = cc.post(rpc_url, json={"jsonrpc":"2.0","method":"eth_getTransactionCount","params":[addr,"latest"],"id":10})
+                            latest_nonce = int(r_nc.json()["result"], 16)
+                        _nonce_local[chain_id] = latest_nonce
+                        approve_tx["nonce"] = latest_nonce
+                        signed2 = Account.sign_transaction(approve_tx, private_key)
+                        raw_hex2 = "0x" + signed2.raw_transaction.hex()
+                        r2b = c.post(rpc_url, json={"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":[raw_hex2],"id":2})
+                        r2j = r2b.json()
+                        if "error" in r2j:
+                            raise ValueError(f"approve tx failed: {r2j['error']}")
+                        approve_tx_hash = r2j.get("result","")
+                        logger.info(f"approve retry success: {approve_tx_hash} nonce={latest_nonce}")
+                    except ValueError:
+                        raise
+                    except Exception as retry_e:
+                        raise ValueError(f"approve tx failed: {err_msg}") from retry_e
+                else:
+                    raise ValueError(f"approve tx failed: {r2j['error']}")
+            else:
+                approve_tx_hash = r2j.get("result","")
             logger.info(f"approve tx submitted: {approve_tx_hash}")
 
         # 等待 approve 确认（最多 30 秒）
@@ -648,18 +834,42 @@ class AveClient:
         _approved_cache.add(cache_key)
         return True  # 仍然返回 True，让调用方重新构造交易
 
-    async def _buy_evm(self, ca, chain, chain_name, in_amount_raw, usdt_addr, wallet_address, wallet_manager):
+    async def _buy_evm(self, ca, chain, chain_name, in_amount_raw, usdt_addr, wallet_address, wallet_manager, skip_approve=False):
         CHAIN_ID = {"bsc": 56, "eth": 1, "base": 8453}
         chain_id = CHAIN_ID.get(chain_name, 56)
 
-        # 读取 swap gasPrice 倍数（默认 1.2，可在配置页面调整）
+        # 读取 swap gasPrice 倍数 + 广播模式（默认 AVE 广播）
         gas_cfg = await _get_gas_cfg()
         try:
             swap_gas_multiplier = float(gas_cfg.get("gas_price_multiplier", "1.2"))
         except Exception:
             swap_gas_multiplier = 1.2
+        direct_broadcast = gas_cfg.get("broadcast_mode", "ave") == "direct"
 
-        # Step 0: getAmountOut 预检——验证代币地址有效且有流动性
+        # Step 0: 检查钱包 inToken 余额是否足够
+        # 原生币（BNB/ETH）= 0xeeee... 时跳过 ERC20 balanceOf 检查（原生币余额检查逻辑不同）
+        is_native = usdt_addr.lower() == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        if not is_native and not skip_approve:
+            try:
+                import httpx as _httpx_bal
+                RPC_BAL = {"bsc": "https://bsc-dataseed1.binance.org", "eth": "https://ethereum-rpc.publicnode.com", "base": "https://mainnet.base.org"}
+                rpc_bal = RPC_BAL.get(chain_name, "https://bsc-dataseed1.binance.org")
+                addr_padded = wallet_address[2:].zfill(64) if wallet_address.startswith("0x") else wallet_address.zfill(64)
+                async with _httpx_bal.AsyncClient(timeout=6.0) as _bc:
+                    _r = await _bc.post(rpc_bal, json={"jsonrpc":"2.0","method":"eth_call","params":[{"to": usdt_addr, "data": "0x70a08231" + addr_padded}, "latest"],"id":1})
+                    bal_hex = _r.json().get("result", "0x0") or "0x0"
+                    bal_raw = int(bal_hex, 16) if bal_hex and bal_hex != "0x" else 0
+                    if bal_raw < int(in_amount_raw) * 0.95:  # 允许5%误差（精度/手续费）
+                        decimals = BUY_IN_DECIMALS.get(chain_name, 18)
+                        bal_u = bal_raw / (10 ** decimals)
+                        need_u = int(in_amount_raw) / (10 ** decimals)
+                        raise ValueError(f"钱包余额不足: 需要 {need_u:.4f}U，当前仅 {bal_u:.4f}U（请充值）")
+            except ValueError:
+                raise
+            except Exception as _be:
+                logger.warning(f"买入前余额检查失败（跳过检查继续执行）: {_be}")
+
+        # Step 0.5: getAmountOut 预检——验证代币地址有效且有流动性
         # 用固定 1U 询价（不受 in_amount_raw 大小影响），避免小额导致误判
         precheck_enabled = True
         try:
@@ -679,7 +889,7 @@ class AveClient:
                 biz_status = probe.get("status") if probe else "N/A"
                 raise ValueError(f"代币预检失败（无法询价）: status={biz_status}，合约地址可能无效或无流动性")
 
-        # Step 1: 确保 USDT 已授权给 AVE router
+        # Step 1: 确保 USDT 已授权给 AVE router（原生币 BNB/ETH 不需要 approve）
         wallet = await wallet_manager.get_wallet_async(chain)
         private_key = wallet["private_key"]
 
@@ -691,16 +901,17 @@ class AveClient:
         if not pre_tx_data:
             raise ValueError("构造交易失败，返回为空")
         # getAmountOut 返回的 spender 才是正确的授权合约地址
-        amount_out_data = await self.get_amount_out(chain_name, in_amount_raw, usdt_addr, ca, "buy")
-        spender_addr = amount_out_data.get("spender", "") or (pre_tx_data.get("txContent") or {}).get("to", "")
-        if spender_addr:
-            await self._ensure_erc20_approved(
-                token_addr=usdt_addr,
-                spender=spender_addr,
-                private_key=private_key,
-                chain_id=chain_id,
-                min_amount=int(in_amount_raw),
-            )
+        if not is_native:
+            amount_out_data = await self.get_amount_out(chain_name, in_amount_raw, usdt_addr, ca, "buy")
+            spender_addr = amount_out_data.get("spender", "") or (pre_tx_data.get("txContent") or {}).get("to", "")
+            if spender_addr:
+                await self._ensure_erc20_approved(
+                    token_addr=usdt_addr,
+                    spender=spender_addr,
+                    private_key=private_key,
+                    chain_id=chain_id,
+                    min_amount=int(in_amount_raw),
+                )
         # 无论 approve 是否发生，都重新构造交易（pre_tx 的 requestTxId 可能已过期）
         tx_data = await self._create_evm_tx(
             chain_name, wallet_address, in_amount_raw,
@@ -713,20 +924,26 @@ class AveClient:
         tx_content = tx_data.get("txContent", {})
         estimate_out = tx_data.get("estimateOut", "0")
         create_price = float(tx_data.get("createPrice", 0))
-        # token 精度：优先用 createEvmTx 返回的 decimals，默认18
-        token_decimals = int(tx_data.get("decimals", 18) or 18)
+        # token 精度：优先用 createEvmTx 返回的 decimals，默认18，防止异常值
+        _raw_dec = int(tx_data.get("decimals", 18) or 18)
+        token_decimals = _raw_dec if 1 <= _raw_dec <= 36 else 18
         logger.info(f"createEvmTx txContent keys={list(tx_content.keys())} gas_in_content={tx_content.get('gas') or tx_content.get('gasLimit')}")
 
         # Step 2: 本地签名（swap 用高 gasPrice 倍数，加速打包）
+        # approve 若命中缓存不更新 _nonce_local，强制重查 pending nonce 避免 nonce too low
+        _nonce_local.pop(chain_id, None)
         alloc_nonce = await self._alloc_nonce(private_key, chain_id)
-        signed_hex = self._sign_evm_tx(tx_content, private_key, chain_id, gas_multiplier=swap_gas_multiplier, nonce=alloc_nonce)
+        signed_hex = self._sign_evm_tx(tx_content, private_key, chain_id, gas_multiplier=swap_gas_multiplier,
+                                        nonce=alloc_nonce, direct_broadcast=direct_broadcast)
 
-        # Step 3: 发送
+        # Step 3: 发送（AVE 广播 或 直接广播）
         try:
-            result = await self._send_signed_evm_tx(chain_name, request_tx_id, signed_hex)
+            if direct_broadcast:
+                result = await self._broadcast_evm_tx_direct(signed_hex, chain_id)
+            else:
+                result = await self._send_signed_evm_tx(chain_name, request_tx_id, signed_hex)
         except Exception:
             # 发送/模拟失败：tx 未上链，nonce 未消耗，回退到 alloc_nonce-1
-            # 下次 _alloc_nonce 查链上若仍是 old_nonce，会直接用链上值而非继续递增
             _nonce_local[chain_id] = alloc_nonce - 1
             raise
         tx_hash = result.get("txHash") or result.get("hash", "")
@@ -743,12 +960,10 @@ class AveClient:
         }
 
     async def _buy_solana(self, ca, chain, chain_name, in_amount_raw, usdt_addr, wallet_address, wallet_manager):
-        # Step 1: 构造
+        # Step 1: 构造（失败时 _create_solana_tx 直接抛 ValueError，含 AVE 返回详情）
         tx_data = await self._create_solana_tx(
             wallet_address, in_amount_raw, usdt_addr, ca, "buy"
         )
-        if not tx_data:
-            raise ValueError("构造 Solana 交易失败")
 
         request_tx_id = tx_data.get("requestTxId", "")
         tx_b64 = tx_data.get("txContent", "")
@@ -764,7 +979,8 @@ class AveClient:
 
         # Step 3: 发送
         result = await self._send_signed_solana_tx(request_tx_id, signed_b64)
-        tx_hash = result.get("txHash", "")
+        # AVE sendSignedSolanaTx 返回字段是 "hash"（不是 "txHash"）
+        tx_hash = result.get("hash") or result.get("txHash") or ""
 
         token_amount = int(estimate_out) / (10 ** token_decimals) if estimate_out and estimate_out != "0" else 0.0
         logger.info(f"Solana buy success: {ca} tx={tx_hash}")
@@ -791,8 +1007,43 @@ class AveClient:
 
         try:
             if chain_name == "solana":
-                # SOL: token_amount 单位 = 代币最小精度，暂按 6 位
-                in_amount_raw = str(int(token_amount * 1e6))
+                # SOL: 查链上真实 token 余额
+                # 使用 getTokenAccountsByOwner 而非 ATA 推导，因为 AVE 可能创建非标准账户
+                # （例如 Token-2022 程序的账户，ATA 地址与标准 SPL 不同）
+                import httpx as _httpx_sol
+                SOL_RPC = "https://api.mainnet-beta.solana.com"
+
+                in_amount_raw = None
+                try:
+                    async with _httpx_sol.AsyncClient(timeout=8.0) as _c:
+                        r = await _c.post(SOL_RPC, json={
+                            "jsonrpc": "2.0", "id": 1,
+                            "method": "getTokenAccountsByOwner",
+                            "params": [
+                                wallet_address,
+                                {"mint": ca},
+                                {"encoding": "jsonParsed"}
+                            ]
+                        })
+                        rj = r.json()
+                        accounts = rj.get("result", {}).get("value", [])
+                        for acct in accounts:
+                            info = acct.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                            raw_amount = info.get("tokenAmount", {}).get("amount", "")
+                            if raw_amount and int(raw_amount) > 0:
+                                in_amount_raw = raw_amount
+                                acct_pubkey = acct.get("pubkey", "")
+                                logger.info(f"SOL sell: token_acct={acct_pubkey} onchain_balance={raw_amount}")
+                                break
+                        if not in_amount_raw:
+                            logger.warning(f"SOL sell: getTokenAccountsByOwner 余额为0或无账户，fallback DB值: {token_amount}")
+                except Exception as _e:
+                    logger.warning(f"SOL sell: 查链上余额失败({_e})，fallback DB值")
+
+                if not in_amount_raw:
+                    # fallback: 用 DB 值 × 1e6（token 通常 6 decimals）
+                    in_amount_raw = str(int(token_amount * 1e6))
+
                 return await self._sell_solana(ca, chain, in_amount_raw, out_token, wallet_address, wallet_manager)
             else:
                 # EVM: 先查链上实际余额和代币 decimals
@@ -801,35 +1052,74 @@ class AveClient:
                 # 2. 用链上余额作为 in_amount_raw（不依赖 DB 记录的 token_amount）
                 # 3. 再用 getAmountOut 查 spender 地址（用链上余额换算的真实数量）
 
-                # Step 1: 从链上 RPC 直接读 decimals 和 balanceOf（最可靠）
+                # Step 1: 从链上 RPC 直接读 decimals 和 balanceOf（多节点确认，防单节点返回旧数据）
                 token_dec = 18
                 chain_raw_balance = 0
-                try:
-                    import httpx as _httpx_sell
-                    RPC_MAP_SELL = {
-                        "bsc": "https://bsc-dataseed1.binance.org",
-                        "eth": "https://ethereum-rpc.publicnode.com",
-                        "base": "https://mainnet.base.org",
-                    }
-                    rpc_sell = RPC_MAP_SELL.get(chain_name, "https://bsc-dataseed1.binance.org")
-                    addr_pad = wallet_address[2:].zfill(64) if wallet_address.startswith("0x") else wallet_address.zfill(64)
-                    async with _httpx_sell.AsyncClient(timeout=8.0) as _c:
-                        # 同时查 balanceOf 和 decimals
-                        r_bal = await _c.post(rpc_sell, json={"jsonrpc":"2.0","method":"eth_call","params":[{"to":ca,"data":"0x70a08231"+addr_pad},"latest"],"id":1})
-                        r_dec = await _c.post(rpc_sell, json={"jsonrpc":"2.0","method":"eth_call","params":[{"to":ca,"data":"0x313ce567"},"latest"],"id":2})
-                    bal_hex = r_bal.json().get("result","0x0") or "0x0"
-                    dec_hex = r_dec.json().get("result","0x12") or "0x12"
-                    chain_raw_balance = int(bal_hex, 16) if bal_hex and bal_hex != "0x" else 0
-                    token_dec = int(dec_hex, 16) if dec_hex and dec_hex != "0x" else 18
-                    logger.info(f"sell RPC: ca={ca[:12]} balance_raw={chain_raw_balance} decimals={token_dec} balance={chain_raw_balance/(10**token_dec):.4f}")
-                except Exception as _e:
-                    logger.warning(f"sell RPC query failed: {_e}, using DB token_amount with dec=18")
+                rpc_query_success = False
 
-                # Step 2: 确定实际卖出数量（优先用链上余额，RPC失败则用DB数量）
+                # BSC 多节点备用列表（依次尝试，直到成功）
+                RPC_FALLBACKS = {
+                    "bsc": [
+                        "https://bsc-dataseed1.binance.org",
+                        "https://bsc-dataseed2.binance.org",
+                        "https://bsc-rpc.publicnode.com",
+                        "https://bsc.meowrpc.com",
+                    ],
+                    "eth": [
+                        "https://ethereum-rpc.publicnode.com",
+                        "https://eth.drpc.org",
+                    ],
+                    "base": [
+                        "https://mainnet.base.org",
+                        "https://base-rpc.publicnode.com",
+                    ],
+                }
+                nodes = RPC_FALLBACKS.get(chain_name, RPC_FALLBACKS.get("bsc", []))
+
+                import httpx as _httpx_sell
+                addr_pad = wallet_address[2:].zfill(64) if wallet_address.startswith("0x") else wallet_address.zfill(64)
+                balance_results: list[int] = []   # 各节点查到的余额
+                last_rpc_err = None
+
+                for _rpc_node in nodes:
+                    try:
+                        async with _httpx_sell.AsyncClient(timeout=6.0) as _c:
+                            r_bal = await _c.post(_rpc_node, json={"jsonrpc":"2.0","method":"eth_call","params":[{"to":ca,"data":"0x70a08231"+addr_pad},"latest"],"id":1})
+                            r_dec = await _c.post(_rpc_node, json={"jsonrpc":"2.0","method":"eth_call","params":[{"to":ca,"data":"0x313ce567"},"latest"],"id":2})
+                        bal_hex = r_bal.json().get("result","0x0") or "0x0"
+                        dec_hex = r_dec.json().get("result","0x12") or "0x12"
+                        node_bal = int(bal_hex, 16) if bal_hex and bal_hex != "0x" else 0
+                        _raw_dec = int(dec_hex, 16) if dec_hex and dec_hex != "0x" else 18
+                        token_dec = _raw_dec if 1 <= _raw_dec <= 36 else 18  # 防止RPC返回异常值(0/255等)
+                        logger.info(f"sell RPC [{_rpc_node[:30]}]: ca={ca[:12]} balance_raw={node_bal} decimals={token_dec} balance={node_bal/(10**token_dec):.4f}")
+                        balance_results.append(node_bal)
+                        rpc_query_success = True
+                        # 找到非零余额则停止，无需再查（优先相信有余额的节点）
+                        if node_bal > 0:
+                            chain_raw_balance = node_bal
+                            break
+                    except Exception as _e:
+                        last_rpc_err = _e
+                        logger.warning(f"sell RPC [{_rpc_node[:30]}] 查询失败: {_e}，尝试下一节点")
+
+                if rpc_query_success and not chain_raw_balance:
+                    # 所有成功查询的节点都返回0——多节点一致确认余额为零
+                    # 这是真实情况（代币归零/转走），不是 RPC 缓存问题
+                    confirmed_zero_count = len(balance_results)
+                    raise ValueError(
+                        f"链上代币余额为零（{confirmed_zero_count}个RPC节点一致确认 balanceOf=0），"
+                        f"无可卖出数量。代币可能已归零、被转走或合约限制。"
+                        f" ca={ca} decimals={token_dec}"
+                    )
+                elif not rpc_query_success:
+                    # 所有 RPC 节点均查询异常（网络问题）
+                    logger.warning(f"sell RPC 所有节点均查询失败（最后错误: {last_rpc_err}），使用DB数量兜底")
+
+                # Step 2: 确定实际卖出数量（优先用链上余额，RPC全部失败则用DB数量兜底）
                 if chain_raw_balance > 0:
                     in_amount_raw = str(chain_raw_balance)  # 直接用链上真实余额，单位已是raw
                 else:
-                    # RPC查询失败时，用DB数量 + 已知decimals兜底
+                    # RPC全部查询失败时，用DB数量 + 已知decimals兜底
                     in_amount_raw = str(int(token_amount * (10 ** token_dec)))
                 logger.info(f"sell in_amount_raw={in_amount_raw} token_dec={token_dec} token_amount={token_amount} chain_raw={chain_raw_balance}")
 
@@ -847,16 +1137,122 @@ class AveClient:
             logger.error(f"Sell error: {e}")
             raise
 
+    async def _approve_calldata_spenders(
+        self,
+        tx_data: dict,
+        token_addr: str,
+        known_spender: str,
+        private_key: str,
+        chain_id: int,
+        in_amount_raw: str,
+        wallet_address: str,
+        chain_name: str,
+    ) -> None:
+        """从 createEvmTx 返回的 calldata 里提取所有合约地址，对未被 approve 的内层 spender 补充授权。
+
+        根因：AVE Router（外层 spender）内部会把 transferFrom 委托给内层合约执行，
+        那个内层合约也需要 token 的 allowance，但 getAmountOut 只返回外层地址。
+        通过解析 calldata 的 32字节对齐地址字段，找出所有候选 spender 并按需 approve。
+        """
+        import re
+
+        tx_content = tx_data.get("txContent", {})
+        raw_data = tx_content.get("data", "") or ""
+
+        # 已知不需要 approve 的地址（token 自身、BNB占位符、WBNB、USDT、USDC、已知spender）
+        SKIP_ADDRS = {
+            token_addr.lower(),
+            wallet_address.lower(),
+            known_spender.lower() if known_spender else "",
+            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",  # ETH/BNB placeholder
+            "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",  # WBNB
+            "0x55d398326f99059ff775485246999027b3197955",  # USDT BEP20
+            "0x10ed43c718714eb63d5aa57b78b54704e256024e",  # PancakeSwap V2 Router
+            "0x13f4ea83d0bd40e75c8222255bc855a974568dd4",  # PancakeSwap V3 Router
+            "0x0000000000000000000000000000000000000000",
+        }
+
+        # 从 calldata 提取所有 32字节对齐的以太坊地址（前12字节为0，后20字节为地址）
+        hex_data = raw_data.replace("0x", "").replace("0X", "")
+        candidates: list[str] = []
+        # 按32字节（64 hex chars）切块，跳过前4字节（函数选择器）
+        chunk_start = 8  # 跳过 4 bytes selector
+        while chunk_start + 64 <= len(hex_data):
+            chunk = hex_data[chunk_start: chunk_start + 64]
+            # 前24 hex = 12 bytes 为 0，后40 hex = 20 bytes 为地址
+            if chunk[:24] == "0" * 24 and chunk[24:] != "0" * 40:
+                addr = "0x" + chunk[24:]
+                candidates.append(addr.lower())
+            chunk_start += 64
+
+        # 去重，过滤跳过列表
+        seen: set[str] = set()
+        to_approve: list[str] = []
+        for addr in candidates:
+            if addr in seen or addr in SKIP_ADDRS:
+                continue
+            seen.add(addr)
+            to_approve.append(addr)
+
+        if not to_approve:
+            return False
+
+        logger.info(f"calldata spender 补充 approve 候选: {to_approve}")
+
+        RPC_MAP = {"bsc": "https://bsc-dataseed1.binance.org", "eth": "https://ethereum-rpc.publicnode.com", "base": "https://mainnet.base.org"}
+        rpc_url = RPC_MAP.get(chain_name, "https://bsc-dataseed1.binance.org")
+
+        import httpx as _httpx
+        from eth_account import Account as _Account
+        addr_pad = wallet_address[2:].zfill(64) if wallet_address.startswith("0x") else wallet_address.zfill(64)
+
+        did_approve = False
+        for inner_spender in to_approve:
+            # 只对真实合约地址（有代码的）补 approve，跳过 EOA
+            try:
+                async with _httpx.AsyncClient(timeout=5.0) as _c:
+                    r_code = await _c.post(rpc_url, json={"jsonrpc":"2.0","method":"eth_getCode","params":[inner_spender,"latest"],"id":1})
+                    code = r_code.json().get("result", "0x")
+                    if not code or code == "0x" or len(code) <= 4:
+                        continue  # EOA，跳过
+
+                    # 查当前 allowance
+                    data_allow = "0xdd62ed3e" + addr_pad + inner_spender[2:].zfill(64)
+                    r_allow = await _c.post(rpc_url, json={"jsonrpc":"2.0","method":"eth_call","params":[{"to":token_addr,"data":data_allow},"latest"],"id":2})
+                    current = int(r_allow.json().get("result","0x0") or "0x0", 16)
+                    if current >= int(in_amount_raw):
+                        logger.info(f"内层spender {inner_spender[:20]} 已有足够 allowance，跳过")
+                        continue
+            except Exception as e:
+                logger.warning(f"检查内层spender {inner_spender[:20]} allowance 失败: {e}")
+                continue
+
+            logger.info(f"为内层spender {inner_spender} 补充 approve token={token_addr[:20]}")
+            try:
+                await self._ensure_erc20_approved(
+                    token_addr=token_addr,
+                    spender=inner_spender,
+                    private_key=private_key,
+                    chain_id=chain_id,
+                    min_amount=int(in_amount_raw),
+                )
+                did_approve = True
+            except Exception as e:
+                logger.warning(f"内层spender {inner_spender[:20]} approve 失败（继续尝试卖出）: {e}")
+
+        return did_approve
+
     async def _sell_evm(self, ca, chain, chain_name, in_amount_raw, out_token, wallet_address, wallet_manager, spender: str = ""):
         CHAIN_ID = {"bsc": 56, "eth": 1, "base": 8453}
         chain_id = CHAIN_ID.get(chain_name, 56)
 
-        # 读取 swap gasPrice 倍数
+        # 读取 swap gasPrice 倍数 + 广播模式
         gas_cfg = await _get_gas_cfg()
         try:
             swap_gas_multiplier = float(gas_cfg.get("gas_price_multiplier", "1.2"))
         except Exception:
             swap_gas_multiplier = 1.2
+        direct_broadcast = gas_cfg.get("broadcast_mode", "ave") == "direct"
 
         wallet = await wallet_manager.get_wallet_async(chain)
         private_key = wallet["private_key"]
@@ -881,9 +1277,36 @@ class AveClient:
             chain_name, wallet_address, in_amount_raw,
             ca, out_token, "sell", slippage_bps=5000
         )
+
+        # Step 0b: 解析 calldata 中的内层合约地址，补全 approve
+        # 问题根因：AVE Router(外层spender)内部会委托另一个合约做 transferFrom，
+        # 那个内层合约同样需要 allowance，但 getAmountOut 只返回外层 spender。
+        # 修复：从 createEvmTx 返回的 calldata 中提取所有合约地址，对不在跳过列表内的地址补 approve。
+        inner_approved = False
+        if tx_data:
+            inner_approved = await self._approve_calldata_spenders(
+                tx_data=tx_data,
+                token_addr=ca,
+                known_spender=spender,
+                private_key=private_key,
+                chain_id=chain_id,
+                in_amount_raw=in_amount_raw,
+                wallet_address=wallet_address,
+                chain_name=chain_name,
+            )
         if not tx_data:
             logger.error(f"构造卖出交易失败: ca={ca} chain={chain_name} in_amount={in_amount_raw} out_token={out_token} wallet={wallet_address}")
             raise ValueError("构造卖出交易失败")
+
+        # 如果补充了内层 approve，重新构造 tx（旧 requestTxId 可能已过期）
+        if inner_approved:
+            logger.info(f"内层 approve 完成，重新构造卖出交易: ca={ca[:16]}")
+            tx_data = await self._create_evm_tx(
+                chain_name, wallet_address, in_amount_raw,
+                ca, out_token, "sell", slippage_bps=5000
+            )
+            if not tx_data:
+                raise ValueError("内层 approve 后重新构造卖出交易失败")
 
         request_tx_id = tx_data.get("requestTxId", "")
         tx_content = tx_data.get("txContent", {})
@@ -891,19 +1314,27 @@ class AveClient:
         create_price = float(tx_data.get("createPrice", 0))
 
         # 签名（swap 用高 gasPrice 倍数）- 预分配 nonce 防并发碰撞
+        # 关键：整个 batch 重试循环共用同一个 nonce。
+        # 原因：3025 simulate 失败意味着 tx 从未广播上链，链上 nonce 不变，
+        # 重试时重新 alloc_nonce 还是得到相同的 nonce（链未变），不如直接复用。
+        # 重要：approve 若命中缓存不走 _alloc_nonce，_nonce_local 可能未更新，
+        # 强制清除本地缓存让 _alloc_nonce 从 pending 重新同步，避免 nonce too low。
+        _nonce_local.pop(chain_id, None)
         alloc_nonce = await self._alloc_nonce(private_key, chain_id)
-        signed_hex = self._sign_evm_tx(tx_content, private_key, chain_id, gas_multiplier=swap_gas_multiplier, nonce=alloc_nonce)
+        signed_hex = self._sign_evm_tx(tx_content, private_key, chain_id, gas_multiplier=swap_gas_multiplier,
+                                        nonce=alloc_nonce, direct_broadcast=direct_broadcast)
         # 尝试发送，如果 3025 simulate 失败则分批卖出（Four.meme 防倾销限制）
         # 注意：只尝试找到第一个能成功的批次比例，剩余 token 由 position_monitor 下一轮继续处理
         total_usdt_received = 0.0
         last_tx_hash = ""
         sold_ratio = 1.0  # 本次实际成交的比例
+        dex_fallback_used = False  # 是否走了 PancakeSwap 直接卖出
         batch_ratios = [1.0, 0.5, 0.25, 0.1, 0.05]
         last_error = None
         for i, batch_ratio in enumerate(batch_ratios):
             batch_amount = str(int(int(in_amount_raw) * batch_ratio))
             if batch_ratio < 1.0:
-                logger.info(f"全量卖出失败，尝试按 {batch_ratio*100:.0f}% 分批: ca={ca[:16]} batch={batch_amount}")
+                logger.info(f"全量卖出失败，尝试按 {batch_ratio*100:.0f}% 分批: ca={ca[:16]} batch={batch_amount} nonce={alloc_nonce}")
                 tx_data = await self._create_evm_tx(
                     chain_name, wallet_address, batch_amount,
                     ca, out_token, "sell", slippage_bps=5000
@@ -914,11 +1345,14 @@ class AveClient:
                 estimate_out_raw = tx_data.get("estimateOut", "0")
                 create_price = float(tx_data.get("createPrice", 0))
                 request_tx_id = tx_data.get("requestTxId", "")
-                # 重试批量时重新分配新 nonce（之前的 nonce 已用于失败的全量尝试，链上 pending 会增加）
-                alloc_nonce = await self._alloc_nonce(private_key, chain_id)
-                signed_hex = self._sign_evm_tx(tx_content, private_key, chain_id, gas_multiplier=swap_gas_multiplier, nonce=alloc_nonce)
+                # 3025 失败意味着 tx 从未上链，nonce 未消耗，直接复用 alloc_nonce
+                signed_hex = self._sign_evm_tx(tx_content, private_key, chain_id, gas_multiplier=swap_gas_multiplier,
+                                                nonce=alloc_nonce, direct_broadcast=direct_broadcast)
             try:
-                result = await self._send_signed_evm_tx(chain_name, request_tx_id, signed_hex)
+                if direct_broadcast:
+                    result = await self._broadcast_evm_tx_direct(signed_hex, chain_id)
+                else:
+                    result = await self._send_signed_evm_tx(chain_name, request_tx_id, signed_hex)
                 last_tx_hash = result.get("txHash") or result.get("hash", "")
                 out_decimals = 18
                 native_received = int(estimate_out_raw) / (10 ** out_decimals) if estimate_out_raw and estimate_out_raw != "0" else 0.0
@@ -931,31 +1365,203 @@ class AveClient:
                 break
             except ValueError as e:
                 last_error = e
-                # 发送/模拟失败：tx 未上链，nonce 未消耗，回退到 alloc_nonce-1
-                _nonce_local[chain_id] = alloc_nonce - 1
-                if "3025" in str(e) and i < len(batch_ratios) - 1:
-                    continue
-                raise
+                if "3025" in str(e):
+                    # 3025 = AVE Router 合约模拟失败，属于路由合约问题，不因批次大小而改变。
+                    # 不做无意义批量重试，立即 fallback 到 DEX 直接卖出。
+                    _nonce_local[chain_id] = alloc_nonce - 1
+                    logger.info(f"AVE 3025 simulate 失败，立即尝试 DEX 直接卖出（跳过批量重试）: ca={ca[:16]}")
+                    dex_err_msg = None
+                    try:
+                        pcs_result = await self._sell_via_dex_direct(
+                            ca, chain_name, chain_id, in_amount_raw,
+                            wallet_address, private_key, swap_gas_multiplier
+                        )
+                        if pcs_result:
+                            native_price = await _get_native_price_usd_async(chain_name)
+                            total_usdt_received = pcs_result["native_received"] * native_price
+                            last_tx_hash = pcs_result["tx_hash"]
+                            sold_ratio = 1.0
+                            dex_fallback_used = True
+                            logger.info(f"DEX 直接卖出成功: {ca} tx={last_tx_hash} usdt={total_usdt_received:.4f}")
+                            break
+                    except Exception as dex_err:
+                        dex_err_msg = str(dex_err)
+                        logger.warning(f"DEX 直接卖出也失败: {dex_err}")
+                    # 把 DEX 失败原因附加到最终错误，方便前端日志显示
+                    if dex_err_msg:
+                        raise ValueError(f"AVE 3025 + DEX fallback 均失败: {dex_err_msg}") from last_error
+                    raise
+                else:
+                    if i < len(batch_ratios) - 1:
+                        # 非 3025 错误，继续尝试更小批次
+                        # 若是 nonce 类错误，从错误消息提取链上期望 nonce 直接使用（比重查 RPC 更准确）
+                        if "nonce" in str(e).lower():
+                            import re as _re
+                            m = _re.search(r"next nonce[:\s]+(\d+)", str(e), _re.IGNORECASE)
+                            if m:
+                                alloc_nonce = int(m.group(1))
+                                _nonce_local[chain_id] = alloc_nonce
+                                logger.info(f"nonce too low，从错误消息提取正确 nonce={alloc_nonce}，重签名继续")
+                            else:
+                                _nonce_local.pop(chain_id, None)
+                                alloc_nonce = await self._alloc_nonce(private_key, chain_id)
+                                logger.info(f"nonce too low，重新同步 nonce={alloc_nonce}，继续下一批次")
+                        else:
+                            logger.info(f"batch {batch_ratio*100:.0f}% 失败（非3025），继续下一批次")
+                        continue
+                    else:
+                        # 所有批次均失败，回退 nonce
+                        _nonce_local[chain_id] = alloc_nonce - 1
+                        raise
 
         # sold_token_amount: position_monitor 用来判断是否部分成交
         # 这里按 sold_ratio 比例计算，monitor 会用 pos.token_amount * ratio 更新剩余量
         # 由于 in_amount_raw 已按正确 decimals 编码，直接从 raw 反推：
-        sold_token_amount = int(in_amount_raw) * sold_ratio / int(in_amount_raw) * (int(in_amount_raw) / (10 ** 18))
-        # 简化：monitor 只关心是否 < pos.token_amount，这里直接返回 sold_ratio * pos_token
-        # 但这里没有 pos.token_amount，用 in_amount_raw 原值的比例代替
-        # monitor 的判断是 remaining = pos.token_amount - sold_token_amount > threshold
-        # 所以只需确保全量卖出时 sold_token_amount == pos.token_amount
-        # 此处无法完整还原，返回 sold_ratio 标志位，monitor 侧处理
         sold_token_amount = sold_ratio  # monitor 收到后用 pos.token_amount * sold_ratio 更新
 
         logger.info(f"EVM sell success: {ca} tx={last_tx_hash} usdt_received={total_usdt_received} sold_ratio={sold_ratio}")
+        sell_route = "PancakeSwap Direct" if dex_fallback_used else "AVE Trade"
         return {
             "success": True,
             "tx": last_tx_hash,
             "usdt_received": total_usdt_received,
             "price": create_price,
             "sold_token_amount": sold_token_amount,
+            "route": sell_route,
         }
+
+    async def _sell_via_dex_direct(
+        self,
+        ca: str,
+        chain_name: str,
+        chain_id: int,
+        in_amount_raw: str,
+        wallet_address: str,
+        private_key: str,
+        gas_multiplier: float = 1.2,
+    ) -> dict | None:
+        """AVE Router 3025 失败时的 fallback：直接构造 DEX swap 交易并广播上链。
+
+        流程：
+        1. Approve token 给 DEX Router（BSC 用 PancakeSwap V2）
+        2. 构造 swapExactTokensForETHSupportingFeeOnTransferTokens calldata
+        3. 本地签名 + 直接 eth_sendRawTransaction 广播（不经过 AVE sendSignedEvmTx）
+        4. 等待收据确认
+
+        返回 {"tx_hash": str, "native_received": float} 或 None
+        """
+        import asyncio as _asyncio
+        import httpx as _httpx
+        from eth_account import Account as _Account
+        from eth_utils import to_checksum_address as _cs
+
+        # 各链 DEX Router（支持 supportingFeeOnTransferTokens 的版本）
+        DEX_ROUTER = {
+            56:    "0x10ED43C718714eb63d5aA57B78B54704E256024E",  # PancakeSwap V2
+            1:     "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",  # Uniswap V2
+            8453:  "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24",  # Aerodrome / Uniswap V2 on Base
+        }
+        WETH = {
+            56:    "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",  # WBNB
+            1:     "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",  # WETH
+            8453:  "0x4200000000000000000000000000000000000006",  # WETH on Base
+        }
+        RPC_MAP = {
+            56:  "https://bsc-dataseed1.binance.org",
+            1:   "https://ethereum-rpc.publicnode.com",
+            8453:"https://mainnet.base.org",
+        }
+
+        router = DEX_ROUTER.get(chain_id)
+        weth   = WETH.get(chain_id)
+        rpc    = RPC_MAP.get(chain_id, "https://bsc-dataseed1.binance.org")
+        if not router or not weth:
+            raise ValueError(f"_sell_via_dex_direct: chain_id={chain_id} 暂不支持直接 DEX 卖出")
+
+        amount_in = int(in_amount_raw)
+
+        # Step 1: Approve DEX Router
+        logger.info(f"DEX 直接卖出 approve: token={ca[:16]} spender={router[:16]} chain={chain_id}")
+        await self._ensure_erc20_approved(
+            token_addr=ca,
+            spender=router,
+            private_key=private_key,
+            chain_id=chain_id,
+            min_amount=amount_in,
+        )
+
+        # Step 2: getAmountsOut 确认有流动性 + 计算 amountOutMin（0滑点保护，因代币有转账税）
+        def ap(addr): return addr.lower()[2:].zfill(64)
+        amount_out_min = 0  # 支持转账税的代币通常需要 amountOutMin=0，让合约自行处理
+
+        # Step 3: 构造 swapExactTokensForETHSupportingFeeOnTransferTokens calldata
+        # 函数签名: 0x791ac947(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)
+        deadline = 0xFFFFFFFF  # 不过期
+        # ABI encode: (uint256, uint256, address[], address, uint256)
+        # path = [ca, weth]
+        calldata = (
+            "0x791ac947"
+            + hex(amount_in)[2:].zfill(64)       # amountIn
+            + hex(amount_out_min)[2:].zfill(64)   # amountOutMin = 0
+            + hex(160)[2:].zfill(64)              # offset to path (5 * 32 = 160)
+            + ap(wallet_address)                   # to
+            + hex(deadline)[2:].zfill(64)          # deadline
+            + hex(2)[2:].zfill(64)                 # path.length = 2
+            + ap(ca)                               # path[0] = token
+            + ap(weth)                             # path[1] = WETH/WBNB
+        )
+
+        # Step 4: 签名 + 广播
+        alloc_nonce = await self._alloc_nonce(private_key, chain_id)
+        _, gas_price = self._fetch_nonce_and_gas(private_key, chain_id, multiplier=gas_multiplier)
+        tx = {
+            "to":       _cs(router),
+            "data":     calldata,
+            "value":    0,
+            "gas":      350_000,
+            "gasPrice": gas_price,
+            "chainId":  chain_id,
+            "nonce":    alloc_nonce,
+        }
+        signed = _Account.sign_transaction(tx, private_key)
+        raw_hex = "0x" + signed.raw_transaction.hex()
+        logger.info(f"DEX 直接广播: router={router[:16]} nonce={alloc_nonce} gas={gas_price/1e9:.2f}Gwei")
+
+        async with _httpx.AsyncClient(timeout=15.0) as c:
+            r = await c.post(rpc, json={"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":[raw_hex],"id":1})
+            rj = r.json()
+            if "error" in rj:
+                _nonce_local[chain_id] = alloc_nonce - 1
+                raise ValueError(f"DEX eth_sendRawTransaction 失败: {rj['error']}")
+            tx_hash = rj.get("result", "")
+            logger.info(f"DEX 交易已广播: {tx_hash}")
+
+        # Step 5: 等待收据，最多 60 秒
+        bnb_received = 0.0
+        for _ in range(30):
+            await _asyncio.sleep(2)
+            async with _httpx.AsyncClient(timeout=8.0) as c:
+                r2 = await c.post(rpc, json={"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":[tx_hash],"id":2})
+                receipt = r2.json().get("result")
+                if receipt:
+                    if receipt.get("status") == "0x1":
+                        # 从 receipt 的 logs 里找 Withdrawal(WETH) 或直接看 ETH 转账
+                        # 简化：用 getAmountsOut 估算收到的 BNB
+                        try:
+                            r3 = await c.post(rpc, json={"jsonrpc":"2.0","method":"eth_call","params":[{"to":router,"data":"0xd06ca61f"+hex(amount_in)[2:].zfill(64)+hex(64)[2:].zfill(64)+hex(2)[2:].zfill(64)+ap(ca)+ap(weth)},"latest"],"id":3})
+                            raw3 = r3.json().get("result","")
+                            if raw3 and len(raw3) >= 2+4*64:
+                                bnb_received = int(raw3[2+3*64:2+4*64], 16) / 1e18
+                        except Exception:
+                            bnb_received = 0.0
+                        logger.info(f"DEX 交易确认: {tx_hash} bnb_received~{bnb_received:.8f}")
+                        return {"tx_hash": tx_hash, "native_received": bnb_received}
+                    else:
+                        _nonce_local[chain_id] = alloc_nonce - 1
+                        raise ValueError(f"DEX 交易 revert: {tx_hash}")
+
+        logger.warning(f"DEX 交易 60s 未确认，仍视为成功: {tx_hash}")
+        return {"tx_hash": tx_hash, "native_received": bnb_received}
 
     async def _sell_solana(self, ca, chain, in_amount_raw, out_token, wallet_address, wallet_manager):
         tx_data = await self._create_solana_tx(
@@ -974,7 +1580,7 @@ class AveClient:
         priv_bytes = b64.b64decode(wallet["private_key"]) if len(wallet["private_key"]) > 64 else bytes.fromhex(wallet["private_key"])
         signed_b64 = self._sign_solana_tx(tx_b64, priv_bytes)
         result = await self._send_signed_solana_tx(request_tx_id, signed_b64)
-        tx_hash = result.get("txHash", "")
+        tx_hash = result.get("hash") or result.get("txHash") or ""
 
         # 卖出收到 SOL，按 9 decimals
         sol_received = int(estimate_out) / 1e9 if estimate_out and estimate_out != "0" else 0.0

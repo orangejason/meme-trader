@@ -54,7 +54,7 @@ async def record_ca_feed(
                 if existing:
                     existing.token_name = str(msg.get("name") or "")
                     existing.symbol = str(msg.get("symbol") or "")
-                    existing.sender = str(msg.get("cxr") or "")
+                    existing.sender = str(msg.get("qy_wxid") or msg.get("cxr") or "")
                     existing.sender_win_rate = _safe_float(msg.get("sender_win_rate"))
                     existing.sender_group_win_rate = _safe_float(msg.get("sender_group_win_rate"))
                     existing.sender_total_tokens = _safe_int(msg.get("sender_total_tokens"))
@@ -102,7 +102,7 @@ async def record_ca_feed(
                 chain=chain,
                 token_name=str(msg.get("name") or ""),
                 symbol=str(msg.get("symbol") or ""),
-                sender=str(msg.get("cxr") or ""),
+                sender=str(msg.get("qy_wxid") or msg.get("cxr") or ""),
                 sender_win_rate=_safe_float(msg.get("sender_win_rate")),
                 sender_group_win_rate=_safe_float(msg.get("sender_group_win_rate")),
                 sender_total_tokens=_safe_int(msg.get("sender_total_tokens")),

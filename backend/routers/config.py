@@ -12,8 +12,11 @@ from services.position_monitor import start_monitor, stop_monitor
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
+# 用户可读写的配置键（不含敏感 API Key）
 VALID_KEYS = {
-    "bot_enabled", "buy_amount_usdt", "take_profit_pct", "stop_loss_pct",
+    "bot_enabled", "auto_buy_enabled", "leaderboard_batch_follow_enabled",
+    "buy_with_bnb_fallback_enabled",
+    "buy_amount_usdt", "take_profit_pct", "stop_loss_pct",
     "max_hold_minutes", "max_concurrent_positions", "enabled_chains", "price_poll_interval",
     # 支出限额
     "spend_limit_enabled", "spend_limit_usdt", "spend_limit_hours",
@@ -41,15 +44,24 @@ VALID_KEYS = {
     "filter_max_holder_pct_enabled", "filter_max_holder_pct_max",
     # 仪表盘显示
     "position_price_source",
-    # API 配置
-    "ave_trade_api_key", "ave_trade_api_url",
-    "ave_data_api_key", "ave_data_api_url",
     # GAS 配置
-    "gas_price_multiplier", "approve_gas_price_gwei",
+    "gas_price_multiplier", "approve_gas_price_gwei", "broadcast_mode",
     # 买入高级配置
     "buy_amount_fallback_enabled", "buy_amount_fallback_usdt",
     "buy_precheck_enabled", "buy_fail_cooldown_seconds",
     "ca_repeat_buy_enabled", "ca_repeat_qwfc_delta",
+    # AI 接口（用户可配置）
+    "ai_enabled", "ai_use_builtin", "ai_builtin_daily_limit",
+    "ai_provider", "ai_model", "ai_max_tokens", "ai_temperature",
+}
+
+# 敏感键：只有管理员可读，普通接口只返回「是否已设置」
+SENSITIVE_KEYS = {
+    "ave_trade_api_key", "ave_trade_api_url",
+    "ave_data_api_key",  "ave_data_api_url",
+    "ai_api_key",        "ai_base_url",
+    "wallet_encrypted_mnemonic",
+    "wallet_demo_encrypted_mnemonic",
 }
 
 
@@ -64,15 +76,27 @@ class ConfigBulkUpdate(BaseModel):
 
 @router.get("")
 async def get_config(db: AsyncSession = Depends(get_db)):
+    """公开配置读取：用户级配置全部返回，敏感字段仅返回 *已设置* 状态"""
     result = await db.execute(select(ConfigModel))
     rows = result.scalars().all()
-    return {r.key: r.value for r in rows}
+    out = {}
+    for r in rows:
+        if r.key in SENSITIVE_KEYS:
+            # 敏感字段：只告知是否有值，不暴露内容
+            out[r.key] = "__set__" if r.value else ""
+        elif r.key not in ("wallet_mode",):
+            # 非敏感字段正常返回（排除内部状态字段）
+            out[r.key] = r.value
+    # wallet_mode 单独返回（前端钱包组件需要）
+    for r in rows:
+        if r.key == "wallet_mode":
+            out["wallet_mode"] = r.value
+    return out
 
 
 @router.put("")
 async def update_config(body: ConfigBulkUpdate, db: AsyncSession = Depends(get_db)):
     prev_bot_enabled = None
-    # 获取当前 bot_enabled 状态
     result = await db.execute(select(ConfigModel).where(ConfigModel.key == "bot_enabled"))
     row = result.scalar_one_or_none()
     if row:
@@ -90,7 +114,6 @@ async def update_config(body: ConfigBulkUpdate, db: AsyncSession = Depends(get_d
 
     await db.commit()
 
-    # 处理 bot_enabled 变更
     if "bot_enabled" in body.configs:
         new_enabled = body.configs["bot_enabled"].lower() == "true"
         if new_enabled and prev_bot_enabled is False:

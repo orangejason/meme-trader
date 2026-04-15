@@ -199,14 +199,14 @@ async def handle_new_ca(raw_message: dict):
     接收到新 CA 推送后的处理入口
     raw_message: WS 消息原始 dict
     """
-    # 提取 CA（统一小写，避免大小写不同导致冷却/去重失效）
+    # 提取 CA
     ca = (
         raw_message.get("ca")
         or raw_message.get("address")
         or raw_message.get("token")
         or raw_message.get("contract")
         or ""
-    ).strip().lower()
+    ).strip()
 
     if not ca:
         broadcaster.log(f"收到无效消息（无CA字段）: {raw_message}", level="warn")
@@ -219,23 +219,25 @@ async def handle_new_ca(raw_message: dict):
         return
 
     # ── 最早拦截（同步，在任何 await 之前） ────────────────
+    # 去重/冷却用小写 key（EVM/SOL 统一），传给 AVE 用原始大小写
+    ca_key = ca.lower()
     # 1. 正在处理中的 CA（并发去重，Lock 保证原子性）
     async with _processing_cas_lock:
-        if ca in _processing_cas:
+        if ca_key in _processing_cas:
             return
         # 2. 买入失败冷却中
-        cooldown_until = _buy_failed_cas.get(ca, 0)
+        cooldown_until = _buy_failed_cas.get(ca_key, 0)
         if cooldown_until > _time.time():
             remaining = int(cooldown_until - _time.time())
             broadcaster.log(f"⏳ {ca[:12]}... 冷却中 {remaining}s", level="warn")
             return
         # 通过后立即占位，防止后续并发协程绕过
-        _processing_cas.add(ca)
+        _processing_cas.add(ca_key)
 
     try:
         await _handle_ca_inner(ca, chain, raw_message)
     finally:
-        _processing_cas.discard(ca)
+        _processing_cas.discard(ca_key)
 
 
 async def _handle_ca_inner(ca: str, chain: str, raw_message: dict):
@@ -306,18 +308,81 @@ async def _handle_ca_inner(ca: str, chain: str, raw_message: dict):
 
         # ── 过滤条件检查 ─────────────────────────────────────
         passed, reason, amount_multiplier = _check_filters(raw_message, cfg)
+        # qy_wxid 是喊单人真实微信 ID（用于跟单匹配），cxr 是昵称（仅用于日志展示）
+        sender = str(raw_message.get("qy_wxid") or raw_message.get("cxr") or "")
+        sender_name = str(raw_message.get("cxr") or sender or "")
+        group_id = str(raw_message.get("qun_id") or "")
+        # 日志中昵称匿名显示（MD5前4位，与牛人榜一致）
+        import hashlib as _hl
+        def _anon(s): return _hl.md5(s.encode('utf-8', errors='replace')).hexdigest()[:4].upper() if s else "????"
+        sender_display = _anon(sender_name) if sender_name else (_anon(sender) if sender else "?????")
+        # 群匿名显示：取 qun_id hash 前4位（与社群榜一致）
+        import hashlib as _hl2
+        def _grp_anon(s):
+            h = 0
+            for c in (s or ''):
+                h = (31 * h + ord(c)) & 0xFFFFFFFF
+            return f"社群·{h:08X}"[:7].upper() if s else "?"
+        group_display = _grp_anon(group_id) if group_id else ""
 
-        # ── 写入 CA 流水（无论是否通过过滤，都记录） ─────────
-        sender = str(raw_message.get("cxr") or "")
+        # ── 写入 CA 流水 ──────────────────────────────────────
         asyncio.create_task(_record_feed_and_sender(
             raw_message, passed, reason, sender, bought=False
         ))
 
         if not passed:
-            broadcaster.log(f"🚫 过滤拦截 [{chain}] {ca[:8]}…: {reason}", level="warn")
-            return
-        if amount_multiplier != 1.0:
-            broadcaster.log(f"过滤通过（{reason}）[{chain}] {ca[:8]}…")
+            # 检查是否有跟单配置覆盖全局过滤（先匹配喊单人，再匹配群）
+            follow_override, match_type = await _check_follow_trader(session, sender, group_id)
+            if follow_override is None:
+                if not sender:
+                    broadcaster.log(f"🚫 过滤拦截 [{chain}] {ca[:8]}…: {reason}（消息无喊单人字段，无法匹配跟单）", level="warn")
+                else:
+                    broadcaster.log(f"🚫 过滤拦截 [{chain}] {ca[:8]}…: {reason}", level="warn")
+                return
+            token_name_log = (str(raw_message.get("symbol") or raw_message.get("name") or "")).replace("*","").strip()
+            follow_src = f"群: {group_display}" if match_type == "group" else f"喊单人: {sender_display}"
+            broadcaster.log(
+                f"🔗 跟单触发 [{chain}] {token_name_log or ca[:8]}…"
+                f" | {follow_src}"
+                f" | 金额: {follow_override['buy_amount']}U"
+                f" | 止盈: +{follow_override['take_profit']}% 止损: -{follow_override['stop_loss']}%"
+                f" | （过滤已拦截: {reason}）",
+                level="warn"
+            )
+            amount_multiplier = follow_override["amount_multiplier"]
+            raw_message["_follow_buy_amount"] = follow_override["buy_amount"]
+            raw_message["_follow_take_profit"] = follow_override["take_profit"]
+            raw_message["_follow_stop_loss"] = follow_override["stop_loss"]
+            raw_message["_follow_max_hold_min"] = follow_override["max_hold_min"]
+            raw_message["_follow_wxid"] = group_id if match_type == "group" else sender
+        else:
+            # 过滤通过后，检查是否开启信息流自动购买
+            auto_buy = cfg.get("auto_buy_enabled", "false").lower() == "true"
+            follow_override, match_type = await _check_follow_trader(session, sender, group_id)
+            if follow_override is not None:
+                token_name_log = (str(raw_message.get("symbol") or raw_message.get("name") or "")).replace("*","").strip()
+                follow_src = f"群: {group_display}" if match_type == "group" else f"喊单人: {sender_display}"
+                broadcaster.log(
+                    f"🔗 跟单触发 [{chain}] {token_name_log or ca[:8]}…"
+                    f" | {follow_src}"
+                    f" | 金额: {follow_override['buy_amount']}U"
+                    f" | 止盈: +{follow_override['take_profit']}% 止损: -{follow_override['stop_loss']}%"
+                )
+                amount_multiplier = follow_override["amount_multiplier"]
+                raw_message["_follow_buy_amount"] = follow_override["buy_amount"]
+                raw_message["_follow_take_profit"] = follow_override["take_profit"]
+                raw_message["_follow_stop_loss"] = follow_override["stop_loss"]
+                raw_message["_follow_max_hold_min"] = follow_override["max_hold_min"]
+                raw_message["_follow_wxid"] = group_id if match_type == "group" else sender
+            elif auto_buy:
+                if amount_multiplier != 1.0:
+                    broadcaster.log(f"✅ 过滤通过（{reason}）[{chain}] {ca[:8]}… 自动买入")
+                else:
+                    broadcaster.log(f"✅ 过滤通过 [{chain}] {ca[:8]}… 自动买入")
+            else:
+                no_follow_hint = f"喊单人: {sender_display}" if sender else "消息无喊单人字段"
+                broadcaster.log(f"👁 观察 [{chain}] {ca[:8]}… 过滤通过，未开启自动购买也无跟单配置（{no_follow_hint}），跳过", level="warn")
+                return
 
         # ── 支出限额检查 ──────────────────────────────────────
         if _enabled(cfg, "spend_limit_enabled"):
@@ -334,6 +399,52 @@ async def _handle_ca_inner(ca: str, chain: str, raw_message: dict):
                 return
 
     await _execute_buy(ca, chain, raw_message, amount_multiplier)
+
+
+async def _check_follow_trader(session, sender_wxid: str, group_id: str = ""):
+    """检查是否有启用的跟单配置。先匹配喊单人 wxid，再匹配群 qun_id。
+    返回 None 表示无需跟单，否则返回 (config_dict, match_type) 元组。
+    match_type: 'sender' | 'group'
+    """
+    try:
+        from database import FollowTrader
+        from sqlalchemy import select as _sel
+
+        def _row_to_cfg(row):
+            return {
+                "buy_amount": float(row.buy_amount) or 0.1,
+                "take_profit": float(row.take_profit),
+                "stop_loss": float(row.stop_loss),
+                "max_hold_min": int(row.max_hold_min),
+                "amount_multiplier": 1.0,
+            }
+
+        # 1. 优先匹配喊单人个人 wxid
+        if sender_wxid:
+            row = (await session.execute(
+                _sel(FollowTrader).where(
+                    FollowTrader.wxid == sender_wxid,
+                    FollowTrader.enabled == True,
+                )
+            )).scalar_one_or_none()
+            if row is not None:
+                return _row_to_cfg(row), "sender"
+
+        # 2. 匹配来源群 qun_id
+        if group_id:
+            row = (await session.execute(
+                _sel(FollowTrader).where(
+                    FollowTrader.wxid == group_id,
+                    FollowTrader.enabled == True,
+                )
+            )).scalar_one_or_none()
+            if row is not None:
+                return _row_to_cfg(row), "group"
+
+        return None, None
+    except Exception as e:
+        logger.warning(f"_check_follow_trader error: {e}")
+        return None, None
 
 
 async def _record_feed_and_sender(
@@ -377,6 +488,12 @@ def _classify_buy_error(err: str, amount_usdt: float = 0.0) -> str:
         return "余额不足"
     if "3027" in err or "slippage" in err.lower():
         return "滑点超限，价格波动过大"
+    if "钱包余额不足" in err or "请充值" in err:
+        import re as _re
+        m = _re.search(r"需要\s*([\d.]+)U.*?当前仅\s*([\d.]+)U", err)
+        if m:
+            return f"USDT 余额不足（需要 {m.group(1)}U，当前仅 {m.group(2)}U，请充值）"
+        return "USDT 余额不足，请充值"
     if "nonce" in err.lower():
         return "Nonce 错误（网络拥堵），稍后会自动重试"
     if "timeout" in err.lower() or "timed out" in err.lower():
@@ -387,34 +504,52 @@ def _classify_buy_error(err: str, amount_usdt: float = 0.0) -> str:
         return "授权失败"
     if "wallet" in err.lower() or "address" in err.lower():
         return "钱包地址错误"
-    return "交易失败（未知原因）"
+    if "already known" in err.lower():
+        return "交易已在链上待处理（重复提交），稍后确认结果"
+    # 截取原始错误前80字符附在描述里，方便排查
+    snippet = err[:80].strip() if err else ""
+    return f"交易失败（未知原因）: {snippet}" if snippet else "交易失败（未知原因）"
 
 
 def _classify_sell_error(err: str) -> str:
     """将卖出异常消息映射为中文原因描述"""
+    # 余额为零（最高优先级，系统主动检测）
+    if "余额为零" in err or "balanceOf=0" in err or "链上代币余额为零" in err:
+        return "链上余额为零，代币已归零或被转走"
+    # Gas 费不足（3024 + BNB/gas 关键词，优先于通用 3024）
+    if ("bnb" in err.lower() or "gas fee" in err.lower() or "not enough" in err.lower()) and ("gas" in err.lower() or "3024" in err):
+        return "主币余额不足，无法支付 Gas（请充值 BNB）"
+    if "3026" in err or "insufficient" in err.lower():
+        return "链上余额不足"
+    if "3025" in err and "DEX fallback" in err:
+        return "合约模拟失败 + DEX 也失败（代币貔貅/限制卖出）"
     if "3025" in err:
-        return "合约模拟失败（代币可能锁定/貔貅/无法卖出）"
+        return "合约模拟失败（代币有交易限制/内盘限卖/貔貅）"
     if "3024" in err:
-        return "无效代币或合约地址"
-    if "3026" in err:
-        return "余额不足"
+        return "AVE 请求无效（代币地址或参数错误）"
     if "3027" in err or "slippage" in err.lower():
         return "滑点超限，价格波动过大"
     if "nonce" in err.lower():
-        return "Nonce 错误"
+        return "Nonce 错误（链上/本地不同步）"
+    if "revert" in err.lower():
+        return "链上交易 revert（合约拒绝，可能有交易限制）"
     if "timeout" in err.lower() or "timed out" in err.lower():
         return "RPC 超时，网络问题"
-    if "insufficient" in err.lower():
-        return "余额不足"
     if "zero" in err.lower() or "balance" in err.lower():
         return "代币余额为零，可能已归零"
+    if "simulate" in err.lower():
+        return "合约模拟失败"
     return "卖出失败（未知原因）"
 
 
 async def _execute_buy(ca: str, chain: str, raw_message: dict, amount_multiplier: float = 1.0):
     async with AsyncSessionLocal() as session:
         cfg = await _get_config(session)
-        base_amount = float(cfg.get("buy_amount_usdt", "2"))
+        # 跟单模式：买入金额、止盈止损由 raw_message 中注入的 _follow_* 字段覆盖
+        if raw_message.get("_follow_buy_amount"):
+            base_amount = float(raw_message["_follow_buy_amount"])
+        else:
+            base_amount = float(cfg.get("buy_amount_usdt", "2"))
         amount_usdt = round(base_amount * amount_multiplier, 4)
         fallback_enabled = cfg.get("buy_amount_fallback_enabled", "true").lower() == "true"
         fallback_usdt = float(cfg.get("buy_amount_fallback_usdt", "1"))
@@ -447,16 +582,17 @@ async def _execute_buy(ca: str, chain: str, raw_message: dict, amount_multiplier
             )
         except Exception as e:
             last_err = str(e)
+            logger.error(f"Buy error [{chain}] {ca[:16]}: {last_err[:300]}")
             last_reason = _classify_buy_error(last_err, try_amount)
-            # 3025 = AVE 模拟失败（代币本身问题），直接冷却不再重试其他金额
-            if "3025" in last_err:
+            # 3025 = AVE 模拟失败；3024 = 无效代币地址 — 代币本身问题，直接冷却不再重试其他金额
+            if "3025" in last_err or "3024" in last_err:
                 break
             continue
 
         if not result.get("success"):
             last_err = str(result.get("msg") or result.get("message") or result)
             last_reason = _classify_buy_error(last_err, try_amount)
-            if "3025" in last_err:
+            if "3025" in last_err or "3024" in last_err:
                 break
             continue
 
@@ -478,6 +614,10 @@ async def _execute_buy(ca: str, chain: str, raw_message: dict, amount_multiplier
                 peak_price=entry_price,
                 current_price=entry_price,
                 status="open",
+                follow_take_profit=float(raw_message.get("_follow_take_profit") or 0),
+                follow_stop_loss=float(raw_message.get("_follow_stop_loss") or 0),
+                follow_max_hold_min=int(raw_message.get("_follow_max_hold_min") or 0),
+                follow_wxid=str(raw_message.get("_follow_wxid") or ""),
             )
             session.add(position)
             await session.commit()
@@ -526,9 +666,12 @@ async def _execute_buy(ca: str, chain: str, raw_message: dict, amount_multiplier
             "token_name": meta.get("token_name", ""),
             "symbol": meta.get("symbol", ""),
             "logo_url": meta.get("logo_url", ""),
+            "route": "AVE Trade",
         })
         display = meta.get("symbol") or meta.get("token_name") or ca[:12] + "..."
-        broadcaster.log(f"✅ 买入成功! {display} [{chain}] 入场 {fmtprice(entry_price)} · 数量 {token_amount:.2f}")
+        is_follow = bool(raw_message.get("_follow_buy_amount"))
+        follow_tag = f" 🔗跟单" if is_follow else ""
+        broadcaster.log(f"✅ 买入成功{follow_tag}! {display} [{chain}] 入场 {fmtprice(entry_price)} · 数量 {token_amount:.2f} · {amount_usdt}U")
 
         if buy_tx:
             asyncio.create_task(_emit_buy_gas(buy_tx, chain, pos_id))
@@ -541,7 +684,7 @@ async def _execute_buy(ca: str, chain: str, raw_message: dict, amount_multiplier
         cooldown_seconds = int(_cfg.get("buy_fail_cooldown_seconds", "300"))
     except Exception:
         cooldown_seconds = 300
-    _buy_failed_cas[ca] = _time.time() + cooldown_seconds
+    _buy_failed_cas[ca.lower()] = _time.time() + cooldown_seconds
     tried = " → ".join(f"{a}U" for a in attempt_amounts)
     broadcaster.emit("buy_failed", {
         "ca": ca, "chain": chain, "token_name": token_name,

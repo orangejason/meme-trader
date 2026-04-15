@@ -8,7 +8,7 @@ export const getPositions = () => api.get('/positions').then(r => r.data)
 export const closePosition = (id) => api.delete(`/positions/${id}`).then(r => r.data)
 export const getTradeHistory = (limit = 50, offset = 0) =>
   api.get('/trades/history', { params: { limit, offset } }).then(r => r.data)
-export const getTradeStats = () => api.get('/trades/stats').then(r => r.data)
+export const getTradeStats = (period = 'all') => api.get('/trades/stats', { params: { period } }).then(r => r.data)
 
 // 钱包管理
 export const getWalletStatus = () => api.get('/wallet/status').then(r => r.data)
@@ -33,3 +33,13 @@ export const getRecentSignals = (limit = 50) =>
 // 信号总览（MEME币接收统计）
 export const getSignalOverview = (period = 'day') =>
   api.get('/analytics/signal_overview', { params: { period } }).then(r => r.data)
+
+// CA 战绩排行榜
+export const getCaLeaderboard = (period = 'week', sort_by = 'pnl') =>
+  api.get('/analytics/ca_leaderboard', { params: { period, sort_by } }).then(r => r.data)
+
+// AI 对话
+export const getAiConfig = () => api.get('/ai/config').then(r => r.data)
+export const saveAiConfig = (body) => api.put('/ai/config', body).then(r => r.data)
+export const sendAiChat = (messages, inject_context = true) =>
+  api.post('/ai/chat', { messages, inject_context }).then(r => r.data)

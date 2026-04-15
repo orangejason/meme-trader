@@ -19,6 +19,14 @@ function shortHash(s) {
   return (h >>> 0).toString(16).slice(0, 4).toUpperCase().padStart(4, '0')
 }
 
+const CHAIN_EXPLORER_TX = {
+  BSC:    tx => `https://bscscan.com/tx/${tx}`,
+  ETH:    tx => `https://etherscan.io/tx/${tx}`,
+  SOL:    tx => `https://solscan.io/tx/${tx}`,
+  BASE:   tx => `https://basescan.org/tx/${tx}`,
+  XLAYER: tx => `https://www.oklink.com/xlayer/tx/${tx}`,
+}
+
 const CHAIN_COLORS = {
   SOL: '#9945FF',
   BSC: '#F0B90B',
@@ -206,7 +214,7 @@ function groupByBucket(series, granularity) {
     return series.map(p => {
       cum += p.pnl_usdt
       return {
-        time: p.time.slice(0, 16).replace('T', ' '),
+        time: new Date(p.time).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }),
         cumPnl: Math.round(cum * 10000) / 10000,
         pnl: p.pnl_usdt,
       }
@@ -214,8 +222,8 @@ function groupByBucket(series, granularity) {
   }
   // 按小时或按天聚合
   const fmt = granularity === 'hour'
-    ? t => t.slice(0, 13).replace('T', ' ') + ':00'  // "2024-01-01 14:00"
-    : t => t.slice(0, 10)                              // "2024-01-01"
+    ? t => { const d = new Date(t); return d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false }).replace(/\//g, '-') }
+    : t => { const d = new Date(t); return d.toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\//g, '-') }
 
   const buckets = new Map()
   for (const p of series) {
@@ -505,7 +513,7 @@ function CaFeedTable({ days }) {
                 className="border-b border-dark-700/50 hover:bg-dark-700/30 cursor-pointer"
                 onClick={() => r.bought && r.position_id && setSelectedCA({ positionId: r.position_id, ca: r.ca })}
               >
-                <td className="py-1.5 pr-2 font-mono whitespace-nowrap">{r.received_at.slice(0, 16).replace('T', ' ')}</td>
+                <td className="py-1.5 pr-2 font-mono whitespace-nowrap">{new Date(r.received_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}</td>
                 <td className="pr-2 font-mono text-gray-300">{r.ca.slice(0, 8)}…</td>
                 <td className="pr-2">
                   <span className="px-1.5 py-0.5 rounded text-xs font-bold" style={{ background: (CHAIN_COLORS[r.chain] || '#6B7280') + '33', color: CHAIN_COLORS[r.chain] || '#9CA3AF' }}>
@@ -565,7 +573,7 @@ function PriceCurveModal({ positionId, ca, onClose }) {
   }, [positionId])
 
   const chartData = data?.snapshots?.map(s => ({
-    time: s.timestamp.slice(11, 16),
+    time: new Date(s.timestamp).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false }),
     price: s.price,
     pnl: s.pnl_pct,
     event: s.event_type,
@@ -622,6 +630,364 @@ function PriceCurveModal({ positionId, ca, onClose }) {
   )
 }
 
+// ── CA 战绩排行榜 ─────────────────────────────────────────────────────────────
+const LEADERBOARD_PERIODS = [
+  // 一行：时段
+  [
+    { key: 'midnight', label: '凌晨' },
+    { key: 'morning',  label: '上午' },
+    { key: 'afternoon',label: '下午' },
+    { key: 'evening',  label: '晚上' },
+    { key: 'today',    label: '今日' },
+    { key: 'yesterday',label: '昨日' },
+  ],
+  // 二行：跨度
+  [
+    { key: 'week',    label: '本周' },
+    { key: 'month',   label: '本月' },
+    { key: 'quarter', label: '季度' },
+    { key: 'year',    label: '年度' },
+    { key: 'all',     label: '全部' },
+  ],
+]
+
+const LEADERBOARD_SORTS = [
+  { key: 'pnl',      label: '总盈亏' },
+  { key: 'win_rate', label: '胜率' },
+  { key: 'best_pnl', label: '最高收益' },
+  { key: 'count',    label: '交易次数' },
+]
+
+const RANK_BADGES = ['🥇', '🥈', '🥉']
+
+function fmtCap(v) {
+  if (!v || v === 0) return '—'
+  if (v >= 1_000_000) return '$' + (v / 1_000_000).toFixed(1) + 'M'
+  if (v >= 1_000) return '$' + (v / 1_000).toFixed(0) + 'K'
+  return '$' + v.toFixed(0)
+}
+
+function fmtPct(v, sign = true) {
+  if (v === null || v === undefined) return '—'
+  return (sign && v > 0 ? '+' : '') + v.toFixed(1) + '%'
+}
+
+function rateColor(v) {
+  if (v === null || v === undefined) return 'text-gray-500'
+  if (v >= 60) return 'text-green-400'
+  if (v >= 40) return 'text-yellow-400'
+  return 'text-red-400'
+}
+
+const REASON_LABELS = {
+  take_profit: '止盈',
+  stop_loss:   '止损',
+  timeout:     '超时',
+  manual:      '手动',
+}
+
+function ExitReasonBadges({ reasons }) {
+  return (
+    <div className="flex flex-wrap gap-0.5">
+      {Object.entries(reasons).map(([reason, cnt]) => (
+        <span
+          key={reason}
+          className={clsx(
+            'text-[9px] px-1 py-0.5 rounded border',
+            reason === 'take_profit' ? 'border-green-800/40 text-green-500 bg-green-900/20' :
+            reason === 'stop_loss'   ? 'border-red-800/40   text-red-400   bg-red-900/20'   :
+            reason === 'timeout'     ? 'border-yellow-800/40 text-yellow-400 bg-yellow-900/20' :
+                                       'border-dark-500 text-gray-500 bg-dark-700/30'
+          )}
+        >
+          {REASON_LABELS[reason] || reason} {cnt > 1 && `×${cnt}`}
+        </span>
+      ))}
+    </div>
+  )
+}
+
+function WinRateBar({ rate, count, win }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <div className="w-16 bg-dark-600 rounded-full h-1.5 overflow-hidden">
+        <div
+          className={clsx('h-full rounded-full', rate >= 60 ? 'bg-green-400' : rate >= 40 ? 'bg-yellow-400' : 'bg-red-400')}
+          style={{ width: `${rate}%` }}
+        />
+      </div>
+      <span className={clsx('text-[11px] font-mono', rateColor(rate))}>{rate.toFixed(0)}%</span>
+      <span className="text-[10px] text-gray-600">{win}/{count}</span>
+    </div>
+  )
+}
+
+function CaLeaderboardCard() {
+  const [period, setPeriod] = useState('today')
+  const [sortBy, setSortBy] = useState('pnl')
+  const [data, setData] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [expanded, setExpanded] = useState(null)
+
+  useEffect(() => {
+    setLoading(true)
+    setExpanded(null)
+    fetch(`/api/analytics/ca_leaderboard?period=${period}&sort_by=${sortBy}&limit=50`)
+      .then(r => r.json())
+      .then(d => { setData(Array.isArray(d) ? d : []); setLoading(false) })
+      .catch(() => setLoading(false))
+  }, [period, sortBy])
+
+  return (
+    <Card>
+      {/* 标题栏 */}
+      <div className="flex items-start justify-between mb-3 flex-wrap gap-2">
+        <div>
+          <SectionTitle>CA 战绩排行榜</SectionTitle>
+          <div className="text-xs text-gray-500 -mt-2">买过的 CA 交易结果汇总</div>
+        </div>
+        {/* 排序维度 */}
+        <div className="flex rounded-lg overflow-hidden border border-dark-500">
+          {LEADERBOARD_SORTS.map(s => (
+            <button
+              key={s.key}
+              onClick={() => setSortBy(s.key)}
+              className={clsx(
+                'text-xs px-2.5 py-1 transition-colors whitespace-nowrap',
+                sortBy === s.key ? 'bg-accent-blue/20 text-accent-blue' : 'text-gray-500 hover:text-gray-300'
+              )}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* 时段按钮（两行） */}
+      <div className="space-y-1 mb-3">
+        {LEADERBOARD_PERIODS.map((row, ri) => (
+          <div key={ri} className="flex gap-1 flex-wrap">
+            {row.map(p => (
+              <button
+                key={p.key}
+                onClick={() => setPeriod(p.key)}
+                className={clsx(
+                  'px-2.5 py-0.5 text-[11px] rounded border transition-colors',
+                  period === p.key
+                    ? 'border-accent-blue/60 text-accent-blue bg-accent-blue/10'
+                    : 'border-dark-500 text-gray-500 hover:text-gray-300'
+                )}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+        ))}
+      </div>
+
+      {/* 内容区 */}
+      {loading ? (
+        <div className="text-gray-500 text-sm py-8 text-center">加载中...</div>
+      ) : data.length === 0 ? (
+        <div className="text-gray-500 text-sm py-8 text-center">该时段无交易记录</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs text-gray-400">
+            <thead className="sticky top-0 bg-dark-800">
+              <tr className="border-b border-dark-600 text-gray-500">
+                <th className="text-left py-1.5 pr-2 w-6 font-medium">#</th>
+                <th className="text-left pr-3 font-medium">代币</th>
+                <th className="text-left pr-3 font-medium">叙事</th>
+                <th className="text-left pr-3 font-medium">出局原因</th>
+                <th className="text-right pr-3 font-medium">总P&L</th>
+                <th className="text-left pr-3 font-medium">胜率</th>
+                <th className="text-right pr-2 font-medium">最高/最低</th>
+                <th className="w-6" />
+              </tr>
+            </thead>
+            <tbody>
+              {data.map((row, idx) => (
+                <>
+                  <tr
+                    key={row.ca + row.chain}
+                    onClick={() => setExpanded(expanded === row.ca ? null : row.ca)}
+                    className={clsx(
+                      'border-b border-dark-700/40 cursor-pointer transition-colors',
+                      row.total_pnl_usdt > 0 ? 'hover:bg-green-900/10 bg-green-900/5' :
+                      row.total_pnl_usdt < 0 ? 'hover:bg-red-900/10 bg-red-900/5' :
+                      'hover:bg-dark-700/30'
+                    )}
+                  >
+                    {/* # 排名 */}
+                    <td className="py-2 pr-2">
+                      <span className={clsx('text-xs font-bold', idx < 3 ? '' : 'text-gray-600')}>
+                        {idx < 3 ? RANK_BADGES[idx] : idx + 1}
+                      </span>
+                    </td>
+
+                    {/* 代币信息 */}
+                    <td className="pr-3">
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className="px-1.5 py-0.5 rounded text-[9px] font-bold"
+                          style={{
+                            background: (CHAIN_COLORS[row.chain] || '#6B7280') + '33',
+                            color: CHAIN_COLORS[row.chain] || '#9CA3AF'
+                          }}
+                        >
+                          {row.chain}
+                        </span>
+                        <div>
+                          <div className="text-gray-200 font-semibold text-[11px]">
+                            {row.symbol || row.token_name || row.ca.slice(0, 6) + '…'}
+                          </div>
+                          <div className="font-mono text-gray-600 text-[10px]">{row.ca.slice(0, 8)}…</div>
+                        </div>
+                      </div>
+                    </td>
+
+                    {/* 叙事 */}
+                    <td className="pr-3">
+                      {row.narrative && (
+                        <div className="space-y-0.5">
+                          {(row.narrative.group_id || row.narrative.sender_id) && (
+                            <div className="flex items-center gap-1">
+                              {row.narrative.group_id && (
+                                <span className="text-blue-400/80 text-[10px] font-mono bg-blue-900/20 px-1 rounded">#{row.narrative.group_id}</span>
+                              )}
+                              {row.narrative.sender_id && (
+                                <span className="text-orange-400/80 text-[10px] font-mono bg-orange-900/20 px-1 rounded">#{row.narrative.sender_id}</span>
+                              )}
+                            </div>
+                          )}
+                          <div className="flex items-center gap-1.5 text-[10px]">
+                            {row.narrative.qwfc > 0 && (
+                              <span className="text-gray-500">热度 <span className="text-gray-300">{row.narrative.qwfc}</span></span>
+                            )}
+                            {row.narrative.market_cap > 0 && (
+                              <span className="text-gray-500">{fmtCap(row.narrative.market_cap)}</span>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </td>
+
+                    {/* 出局原因 */}
+                    <td className="pr-3">
+                      <ExitReasonBadges reasons={row.exit_reasons} />
+                    </td>
+
+                    {/* 总P&L */}
+                    <td className={clsx(
+                      'text-right pr-3 font-mono font-semibold',
+                      row.total_pnl_usdt > 0 ? 'text-green-400' :
+                      row.total_pnl_usdt < 0 ? 'text-red-400' : 'text-gray-500'
+                    )}>
+                      {row.total_pnl_usdt > 0 ? '+' : ''}{row.total_pnl_usdt.toFixed(3)}U
+                      <div className="text-gray-600 font-normal text-[10px]">{row.trade_count} 笔</div>
+                    </td>
+
+                    {/* 胜率 */}
+                    <td className="pr-3">
+                      <WinRateBar rate={row.win_rate} count={row.trade_count} win={row.win_count} />
+                    </td>
+
+                    {/* 最高/最低 */}
+                    <td className="text-right pr-2 font-mono">
+                      <div className="text-green-400 text-[11px]">{fmtPct(row.best_pnl_pct)}</div>
+                      <div className="text-red-400 text-[11px]">{fmtPct(row.worst_pnl_pct)}</div>
+                    </td>
+
+                    {/* 展开按钮 */}
+                    <td className="text-gray-600 text-xs">
+                      <span className={clsx('transition-transform inline-block', expanded === row.ca ? 'rotate-180' : '')}>▼</span>
+                    </td>
+                  </tr>
+
+                  {/* 展开行：每笔交易详情 */}
+                  {expanded === row.ca && (
+                    <tr key={row.ca + '_detail'} className="border-b border-dark-600/40">
+                      <td colSpan={8} className="bg-dark-900/40 px-4 py-3">
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                          {/* 叙事完整展示 */}
+                          {row.narrative && Object.keys(row.narrative).length > 0 && (
+                            <div className="text-xs text-gray-500 space-y-1">
+                              <div className="text-gray-400 font-semibold mb-1">叙事数据</div>
+                              {row.narrative.sender_win_rate > 0 && (
+                                <div>喊单人WS胜率: <span className={rateColor(row.narrative.sender_win_rate)}>{row.narrative.sender_win_rate.toFixed(1)}%</span></div>
+                              )}
+                              {row.narrative.group_win_rate > 0 && (
+                                <div>社区WS胜率: <span className={rateColor(row.narrative.group_win_rate)}>{row.narrative.group_win_rate.toFixed(1)}%</span></div>
+                              )}
+                              {row.narrative.market_cap > 0 && <div>市值: {fmtCap(row.narrative.market_cap)}</div>}
+                              {row.narrative.holders > 0 && <div>持仓人数: {row.narrative.holders}</div>}
+                              {row.narrative.bqfc > 0 && <div>本群热度: {row.narrative.bqfc}</div>}
+                              {row.narrative.qwfc > 0 && <div>全网热度: {row.narrative.qwfc}</div>}
+                              {row.narrative.current_multiple > 0 && (
+                                <div>市场倍数: <span className="text-yellow-400">{row.narrative.current_multiple}x</span></div>
+                              )}
+                              {row.narrative.risk_score > 0 && (
+                                <div>风险评分: <span className={row.narrative.risk_score >= 70 ? 'text-red-400' : 'text-yellow-400'}>{row.narrative.risk_score}</span></div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* 每笔交易列表 */}
+                          <div>
+                            <div className="text-xs text-gray-400 font-semibold mb-1">交易明细</div>
+                            <div className="space-y-1 max-h-48 overflow-y-auto">
+                              {row.trades.map(t => (
+                                <div key={t.id} className="flex items-center gap-2 text-[11px] text-gray-500 border-b border-dark-700/30 pb-1">
+                                  <span className="font-mono text-gray-600 w-24 shrink-0">
+                                    {new Date(t.close_time).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}
+                                  </span>
+                                  <span className={clsx('font-mono font-semibold w-16 shrink-0',
+                                    t.pnl_usdt > 0 ? 'text-green-400' : 'text-red-400'
+                                  )}>
+                                    {t.pnl_usdt > 0 ? '+' : ''}{t.pnl_usdt.toFixed(3)}U
+                                  </span>
+                                  <span className={clsx('font-mono w-14 shrink-0',
+                                    t.pnl_pct > 0 ? 'text-green-400/70' : 'text-red-400/70'
+                                  )}>
+                                    {fmtPct(t.pnl_pct)}
+                                  </span>
+                                  <span className={clsx('px-1 rounded text-[9px]',
+                                    t.reason === 'take_profit' ? 'bg-green-900/20 text-green-500' :
+                                    t.reason === 'stop_loss'   ? 'bg-red-900/20 text-red-400' :
+                                    t.reason === 'timeout'     ? 'bg-yellow-900/20 text-yellow-400' :
+                                    'bg-dark-700/30 text-gray-500'
+                                  )}>
+                                    {REASON_LABELS[t.reason] || t.reason}
+                                  </span>
+                                  {t.sell_tx && (
+                                    <a
+                                      href={(CHAIN_EXPLORER_TX[row.chain] || (tx => `https://bscscan.com/tx/${tx}`))(t.sell_tx)}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-blue-500/60 hover:text-blue-400 text-[10px] ml-auto"
+                                      onClick={e => e.stopPropagation()}
+                                    >
+                                      Tx ↗
+                                    </a>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  )
+}
+
 // ── 主 Analytics 面板 ─────────────────────────────────────────────────────────
 // days 由父组件（仪表盘）传入，面板本身不再管理时间范围
 export default function AnalyticsPanel({ days = 7 }) {
@@ -636,7 +1002,10 @@ export default function AnalyticsPanel({ days = 7 }) {
       {/* 第二行：P&L 曲线（全宽） */}
       <PnlCurveCard days={days} />
 
-      {/* 第三行：发币人排行 + CA 流水 */}
+      {/* 第三行：CA 战绩排行榜（全宽） */}
+      <CaLeaderboardCard />
+
+      {/* 第四行：发币人排行 + CA 流水 */}
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-4 items-start">
         <div className="lg:col-span-2">
           <SenderLeaderboardCard days={days} />

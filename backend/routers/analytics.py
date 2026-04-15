@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc, Integer
 from datetime import datetime, timedelta
 import hashlib
-from database import get_db, CaFeed, SenderStats, Trade, Position, PriceSnapshot
+from database import get_db, CaFeed, SenderStats, Trade, Position, PriceSnapshot, LeaderboardSnapshot, FollowTrader
 
 
 def _short_hash(s: str, length: int = 4) -> str:
@@ -244,7 +244,7 @@ async def get_sender_leaderboard(
             "ws_win_rate": float(f.ws_win_rate or 0) if f else float(s.ws_win_rate or 0 if s else 0),
             "ws_total_tokens": int(f.ws_total_tokens or 0) if f else int(s.ws_total_tokens or 0 if s else 0),
             "ws_best_multiple": float(f.ws_best_multiple or 0) if f else float(s.ws_best_multiple or 0 if s else 0),
-            "last_seen": f.last_seen.isoformat() if f and f.last_seen else (s.last_seen.isoformat() if s and s.last_seen else None),
+            "last_seen": (f.last_seen.isoformat() + "Z") if f and f.last_seen else ((s.last_seen.isoformat() + "Z") if s and s.last_seen else None),
             "has_trade": feed_bought > 0,
         })
 
@@ -280,7 +280,7 @@ async def get_pnl_series(days: int = 30, db: AsyncSession = Depends(get_db)):
     for t in trades:
         cumulative += t.pnl_usdt
         series.append({
-            "time": t.close_time.isoformat(),
+            "time": t.close_time.isoformat() + "Z",
             "pnl_usdt": round(t.pnl_usdt, 4),
             "cumulative_pnl": round(cumulative, 4),
             "reason": t.reason,
@@ -347,7 +347,7 @@ async def get_ca_feed(
         "data": [
             {
                 "id": r.id,
-                "received_at": r.received_at.isoformat(),
+                "received_at": r.received_at.isoformat() + "Z",
                 "ca": r.ca,
                 "chain": r.chain,
                 "token_name": r.token_name,
@@ -409,7 +409,7 @@ async def get_recent_signals(
 
         out.append({
             "id": r.id,
-            "received_at": r.received_at.isoformat(),
+            "received_at": r.received_at.isoformat() + "Z",
             "ca": r.ca,
             "chain": r.chain,
             "symbol": r.symbol or r.token_name or "",
@@ -445,11 +445,11 @@ async def get_price_curve(position_id: int, db: AsyncSession = Depends(get_db)):
             "entry_price": pos.entry_price,
             "amount_usdt": pos.amount_usdt,
             "status": pos.status,
-            "open_time": pos.open_time.isoformat() if pos.open_time else None,
+            "open_time": (pos.open_time.isoformat() + "Z") if pos.open_time else None,
         } if pos else None,
         "snapshots": [
             {
-                "timestamp": s.timestamp.isoformat(),
+                "timestamp": s.timestamp.isoformat() + "Z",
                 "price": s.price,
                 "pnl_pct": s.pnl_pct,
                 "event_type": s.event_type,
@@ -594,7 +594,7 @@ async def get_portfolio(db: AsyncSession = Depends(get_db)):
             "amount_usdt": pos.amount_usdt,
             "value_usdt": round(value_usdt, 4),
             "pnl_pct": round(pnl_pct, 2),
-            "open_time": pos.open_time.isoformat() if pos.open_time else None,
+            "open_time": (pos.open_time.isoformat() + "Z") if pos.open_time else None,
         })
 
     # 并发查询各链主链余额
@@ -720,3 +720,451 @@ async def get_portfolio(db: AsyncSession = Depends(get_db)):
         "total_position_value_usdt": round(total_position_value, 4),
         "chains": chains_data,
     }
+
+
+# ── CA 战绩排行榜 ──────────────────────────────────────────────────────────────
+def _ca_leaderboard_range(period: str) -> tuple:
+    """返回 (start_utc, end_utc)，None 表示无限制。北京时间 UTC+8 感知。"""
+    now_utc = datetime.utcnow()
+    bj_now = now_utc + timedelta(hours=8)
+    bj_today_start = bj_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    utc_today_start = bj_today_start - timedelta(hours=8)
+
+    ranges = {
+        "morning":   (utc_today_start + timedelta(hours=6),  utc_today_start + timedelta(hours=12)),
+        "afternoon": (utc_today_start + timedelta(hours=12), utc_today_start + timedelta(hours=18)),
+        "evening":   (utc_today_start + timedelta(hours=18), utc_today_start + timedelta(hours=24)),
+        "midnight":  (utc_today_start,                       utc_today_start + timedelta(hours=6)),
+        "today":     (utc_today_start,                       None),
+        "yesterday": (utc_today_start - timedelta(days=1),   utc_today_start),
+        "week":      (now_utc - timedelta(days=7),           None),
+        "month":     (now_utc - timedelta(days=30),          None),
+        "quarter":   (now_utc - timedelta(days=90),          None),
+        "year":      (now_utc - timedelta(days=365),         None),
+        "all":       (None,                                  None),
+    }
+    return ranges.get(period, ranges["week"])
+
+
+@router.get("/ca_leaderboard")
+async def get_ca_leaderboard(
+    period: str = "week",
+    sort_by: str = "pnl",   # pnl | win_rate | best_pnl | count
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+):
+    """CA 战绩排行榜：按 CA 聚合交易结果，附带叙事数据"""
+    import json as _json
+
+    start_utc, end_utc = _ca_leaderboard_range(period)
+
+    # 1. 按时段过滤交易记录，排除 sell_failed
+    q = select(Trade).where(Trade.reason != "sell_failed")
+    if start_utc:
+        q = q.where(Trade.close_time >= start_utc)
+    if end_utc:
+        q = q.where(Trade.close_time < end_utc)
+
+    result = await db.execute(q.order_by(Trade.close_time))
+    trades = result.scalars().all()
+
+    if not trades:
+        return []
+
+    # 2. 按 ca+chain 聚合
+    from collections import defaultdict
+    groups: dict[tuple, list] = defaultdict(list)
+    for t in trades:
+        groups[(t.ca, t.chain)].append(t)
+
+    # 3. 批量查 CaFeed（最新一条）
+    ca_list = list({ca for ca, _ in groups.keys()})
+    feed_map: dict[str, object] = {}
+    if ca_list:
+        # 子查询：每个 CA 最新的 CaFeed id
+        subq = (
+            select(func.max(CaFeed.id).label("max_id"))
+            .where(CaFeed.ca.in_(ca_list))
+            .group_by(CaFeed.ca)
+        ).subquery()
+        feed_result = await db.execute(
+            select(CaFeed).where(CaFeed.id.in_(select(subq.c.max_id)))
+        )
+        for f in feed_result.scalars().all():
+            feed_map[f.ca] = f
+
+    # 4. 每笔交易的详情（用于展开行）—— 避免后续 lazy load
+    def _trade_detail(t: Trade) -> dict:
+        return {
+            "id": t.id,
+            "close_time": t.close_time.isoformat() + "Z",
+            "open_time": t.open_time.isoformat() + "Z" if t.open_time else None,
+            "pnl_usdt": round(t.pnl_usdt, 4),
+            "pnl_pct": round(t.pnl_pct, 2),
+            "entry_price": t.entry_price,
+            "exit_price": t.exit_price,
+            "amount_usdt": t.amount_usdt,
+            "reason": t.reason,
+            "buy_tx": t.buy_tx,
+            "sell_tx": t.sell_tx,
+        }
+
+    # 5. 组装结果
+    rows = []
+    for (ca, chain), tlist in groups.items():
+        total_pnl = sum(t.pnl_usdt for t in tlist)
+        pnl_pcts = [t.pnl_pct for t in tlist]
+        win_count = sum(1 for t in tlist if t.pnl_usdt > 0)
+        trade_count = len(tlist)
+        exit_reasons: dict[str, int] = {}
+        for t in tlist:
+            exit_reasons[t.reason] = exit_reasons.get(t.reason, 0) + 1
+
+        # 叙事数据来自 CaFeed
+        feed = feed_map.get(ca)
+        narrative = {}
+        if feed:
+            sender_raw = feed.sender or ""
+            group_raw = ""
+            try:
+                raw = _json.loads(feed.raw_json or "{}")
+                group_raw = raw.get("qun_name", "") or ""
+            except Exception:
+                pass
+            narrative = {
+                "sender_id": _short_hash(sender_raw) if sender_raw else None,
+                "group_id": _short_hash(group_raw) if group_raw else None,
+                "sender_win_rate": feed.sender_win_rate,
+                "group_win_rate": feed.sender_group_win_rate,
+                "bqfc": feed.bqfc,
+                "qwfc": feed.qwfc,
+                "market_cap": feed.market_cap,
+                "holders": feed.holders,
+                "current_multiple": feed.current_multiple,
+                "risk_score": feed.risk_score,
+            }
+
+        rows.append({
+            "ca": ca,
+            "chain": chain,
+            "symbol": feed.symbol if feed else "",
+            "token_name": feed.token_name if feed else "",
+            "trade_count": trade_count,
+            "total_pnl_usdt": round(total_pnl, 4),
+            "avg_pnl_pct": round(sum(pnl_pcts) / len(pnl_pcts), 2),
+            "best_pnl_pct": round(max(pnl_pcts), 2),
+            "worst_pnl_pct": round(min(pnl_pcts), 2),
+            "win_count": win_count,
+            "win_rate": round(win_count / trade_count * 100, 1) if trade_count else 0,
+            "exit_reasons": exit_reasons,
+            "first_trade": min(t.close_time for t in tlist).isoformat() + "Z",
+            "last_trade": max(t.close_time for t in tlist).isoformat() + "Z",
+            "narrative": narrative,
+            "trades": [_trade_detail(t) for t in sorted(tlist, key=lambda x: x.close_time, reverse=True)],
+        })
+
+    # 6. 排序
+    sort_key = {
+        "pnl": lambda x: x["total_pnl_usdt"],
+        "win_rate": lambda x: (x["win_rate"], x["trade_count"]),
+        "best_pnl": lambda x: x["best_pnl_pct"],
+        "count": lambda x: x["trade_count"],
+    }.get(sort_by, lambda x: x["total_pnl_usdt"])
+
+    rows.sort(key=sort_key, reverse=True)
+    return rows[:limit]
+
+
+@router.get("/leaderboard_proxy")
+async def leaderboard_proxy(rise_threshold: float = 0.2, db: AsyncSession = Depends(get_db)):
+    """代理请求 hodlo.ai 牛人榜，顺带保存今日快照"""
+    import httpx
+    from sqlalchemy import select, delete
+    url = f"https://hodlo.ai/api/v1/token-data/today-ca-senders-rank?rise_threshold={rise_threshold}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            payload = r.json()
+
+        # 保存今日快照（北京时间日期，每人每天只存一条，重复则更新）
+        from datetime import timezone, timedelta
+        bj_date = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+        for item in payload.get("data", []):
+            wxid = item.get("qy_wxid", "")
+            ca_count = item.get("ca_count") or 0
+            total_mult = item.get("total_multiplier") or 0.0
+            avg_mult = total_mult / ca_count if ca_count > 0 else 0.0
+            wr_str = item.get("today_win_rate", "0%")
+            win_rate = float(str(wr_str).replace("%", "") or 0)
+
+            # upsert：先删今天同一人的旧快照，再插新的
+            await db.execute(
+                delete(LeaderboardSnapshot).where(
+                    LeaderboardSnapshot.wxid == wxid,
+                    LeaderboardSnapshot.date == bj_date,
+                )
+            )
+            db.add(LeaderboardSnapshot(
+                wxid=wxid,
+                name=item.get("name", ""),
+                date=bj_date,
+                avg_mult=avg_mult,
+                win_rate=win_rate,
+                ca_count=ca_count,
+            ))
+        await db.commit()
+
+        # 清理 8 天前的旧快照
+        cutoff = (datetime.now(timezone.utc) + timedelta(hours=8) - timedelta(days=8)).strftime("%Y-%m-%d")
+        await db.execute(delete(LeaderboardSnapshot).where(LeaderboardSnapshot.date < cutoff))
+        await db.commit()
+
+        # ── 附加每人的本系统跟单战绩 ──────────────────────────────────────────
+        wxid_list = [item.get("qy_wxid", "") for item in payload.get("data", []) if item.get("qy_wxid")]
+        follow_stats: dict[str, dict] = {}
+        if wxid_list:
+            from database import Position
+            # 查所有跟单持仓（follow_wxid 在 wxid_list 中）
+            pos_rows = (await db.execute(
+                select(Position).where(
+                    Position.follow_wxid.in_(wxid_list),
+                    Position.status.in_(["open", "closed"]),
+                )
+            )).scalars().all()
+            # 按 follow_wxid 聚合
+            from collections import defaultdict
+            pos_by_wxid: dict[str, list] = defaultdict(list)
+            for p in pos_rows:
+                pos_by_wxid[p.follow_wxid].append(p)
+            # 查对应的 Trade 记录（position_id in）
+            pos_ids = [p.id for p in pos_rows]
+            trade_by_pos: dict[int, Trade] = {}
+            if pos_ids:
+                trade_rows = (await db.execute(
+                    select(Trade).where(Trade.position_id.in_(pos_ids))
+                )).scalars().all()
+                for t in trade_rows:
+                    trade_by_pos[t.position_id] = t
+            # 聚合统计
+            for wxid, positions in pos_by_wxid.items():
+                closed = [p for p in positions if p.status == "closed"]
+                open_cnt = len([p for p in positions if p.status == "open"])
+                trades = [trade_by_pos[p.id] for p in closed if p.id in trade_by_pos]
+                win = [t for t in trades if t.pnl_usdt > 0]
+                total_pnl = sum(t.pnl_usdt for t in trades)
+                # 最近5个币种（按开仓时间倒序）
+                recent_tokens = []
+                for p in sorted(positions, key=lambda x: x.open_time or datetime.utcfromtimestamp(0), reverse=True)[:5]:
+                    t = trade_by_pos.get(p.id)
+                    recent_tokens.append({
+                        "ca": p.ca,
+                        "chain": p.chain,
+                        "symbol": "",  # 后续前端可从 feed 取
+                        "pnl_pct": round(t.pnl_pct, 1) if t else None,
+                        "pnl_usdt": round(t.pnl_usdt, 3) if t else None,
+                        "status": p.status,
+                        "open_time": (p.open_time.isoformat() + "Z") if p.open_time else None,
+                    })
+                follow_stats[wxid] = {
+                    "follow_count": len(positions),
+                    "closed_count": len(closed),
+                    "open_count": open_cnt,
+                    "win_count": len(win),
+                    "win_rate": round(len(win) / len(trades) * 100, 1) if trades else None,
+                    "total_pnl_usdt": round(total_pnl, 3),
+                    "recent_tokens": recent_tokens,
+                }
+        # 把跟单统计注入到每个 item
+        for item in payload.get("data", []):
+            wxid = item.get("qy_wxid", "")
+            item["follow_stats"] = follow_stats.get(wxid, None)
+
+        return payload
+    except Exception as e:
+        return {"status": "error", "message": str(e), "data": []}
+
+
+@router.get("/community_leaderboard_proxy")
+async def community_leaderboard_proxy(
+    rise_threshold: float = 0.2,
+    sort_by: str = "today",
+    db: AsyncSession = Depends(get_db),
+):
+    """代理 hodlo.ai 社群胜率榜"""
+    import httpx
+    url = f"https://hodlo.ai/api/v1/token-data/community-win-rate-rank?rise_threshold={rise_threshold}&sort_by={sort_by}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            payload = r.json()
+        return payload
+    except Exception as e:
+        return {"status": "error", "message": str(e), "data": []}
+
+
+@router.get("/leaderboard_history")
+async def leaderboard_history(db: AsyncSession = Depends(get_db)):
+    """返回过去 7 天每位喊单人的每日均倍数，用于前端绘制曲线"""
+    from sqlalchemy import select
+    from datetime import timezone, timedelta
+    rows = (await db.execute(
+        select(LeaderboardSnapshot).order_by(LeaderboardSnapshot.date.asc())
+    )).scalars().all()
+
+    # 按 wxid 聚合
+    history: dict[str, list] = {}
+    for row in rows:
+        if row.wxid not in history:
+            history[row.wxid] = []
+        history[row.wxid].append({
+            "date": row.date,
+            "avg_mult": row.avg_mult,
+            "win_rate": row.win_rate,
+            "ca_count": row.ca_count,
+        })
+    return history
+
+
+# ── 跟单 CRUD ────────────────────────────────────────────────────────────────
+
+@router.get("/follow_traders")
+async def list_follow_traders(db: AsyncSession = Depends(get_db)):
+    """获取所有跟单配置"""
+    rows = (await db.execute(select(FollowTrader))).scalars().all()
+    return [
+        {
+            "wxid": r.wxid, "name": r.name, "enabled": r.enabled,
+            "buy_amount": r.buy_amount, "take_profit": r.take_profit,
+            "stop_loss": r.stop_loss, "max_hold_min": r.max_hold_min,
+            "note": r.note,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/follow_traders")
+async def upsert_follow_trader(body: dict, db: AsyncSession = Depends(get_db)):
+    """新增或更新跟单配置（按 wxid upsert）"""
+    from sqlalchemy import select as _sel
+    wxid = body.get("wxid", "").strip()
+    if not wxid:
+        return {"success": False, "error": "wxid required"}
+    # 参数校验
+    take_profit = float(body.get("take_profit", 50.0))
+    stop_loss   = float(body.get("stop_loss", 30.0))
+    buy_amount  = float(body.get("buy_amount", 0.1))
+    max_hold_min= int(body.get("max_hold_min", 60))
+    if take_profit <= 0:
+        return {"success": False, "error": "take_profit 必须大于 0"}
+    if stop_loss <= 0:
+        return {"success": False, "error": "stop_loss 必须大于 0"}
+    if buy_amount <= 0:
+        return {"success": False, "error": "buy_amount 必须大于 0"}
+    if max_hold_min <= 0:
+        return {"success": False, "error": "max_hold_min 必须大于 0"}
+    row = (await db.execute(_sel(FollowTrader).where(FollowTrader.wxid == wxid))).scalar_one_or_none()
+    if row:
+        row.name        = body.get("name", row.name)
+        row.enabled     = bool(body.get("enabled", row.enabled))
+        row.buy_amount  = buy_amount
+        row.take_profit = take_profit
+        row.stop_loss   = stop_loss
+        row.max_hold_min= max_hold_min
+        row.note        = body.get("note", row.note)
+    else:
+        db.add(FollowTrader(
+            wxid=wxid,
+            name=body.get("name", ""),
+            enabled=bool(body.get("enabled", True)),
+            buy_amount=buy_amount,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+            max_hold_min=max_hold_min,
+            note=body.get("note", ""),
+        ))
+    await db.commit()
+    return {"success": True}
+
+
+@router.delete("/follow_traders/{wxid}")
+async def delete_follow_trader(wxid: str, db: AsyncSession = Depends(get_db)):
+    """删除跟单配置"""
+    from sqlalchemy import delete as _del
+    await db.execute(_del(FollowTrader).where(FollowTrader.wxid == wxid))
+    await db.commit()
+    return {"success": True}
+
+
+@router.post("/follow_traders/batch")
+async def batch_follow_traders(body: dict, db: AsyncSession = Depends(get_db)):
+    """批量新增/更新跟单配置（一键跟单）"""
+    from sqlalchemy import select as _sel
+    traders = body.get("traders", [])   # [{wxid, name}, ...]
+    defaults = body.get("defaults", {})
+    buy_amount  = float(defaults.get("buy_amount", 0.1))
+    take_profit = float(defaults.get("take_profit", 50.0))
+    stop_loss   = float(defaults.get("stop_loss", 30.0))
+    max_hold_min = int(defaults.get("max_hold_min", 60))
+
+    added = updated = 0
+    for t in traders:
+        wxid = str(t.get("wxid", "")).strip()
+        if not wxid:
+            continue
+        row = (await db.execute(_sel(FollowTrader).where(FollowTrader.wxid == wxid))).scalar_one_or_none()
+        if row:
+            row.enabled      = True
+            row.buy_amount   = buy_amount
+            row.take_profit  = take_profit
+            row.stop_loss    = stop_loss
+            row.max_hold_min = max_hold_min
+            updated += 1
+        else:
+            db.add(FollowTrader(
+                wxid=wxid, name=t.get("name", ""),
+                enabled=True,
+                buy_amount=buy_amount, take_profit=take_profit,
+                stop_loss=stop_loss, max_hold_min=max_hold_min,
+                note="一键跟单",
+            ))
+            added += 1
+    await db.commit()
+    return {"success": True, "added": added, "updated": updated}
+
+
+
+# ── 喊单人详情 ────────────────────────────────────────────────────────────────
+
+@router.get("/caller_detail/{wxid}")
+async def caller_detail(wxid: str, db: AsyncSession = Depends(get_db)):
+    """喊单人详情：历史快照 + 跟单状态"""
+    from sqlalchemy import select as _sel
+    # 历史快照（7天）
+    snaps = (await db.execute(
+        _sel(LeaderboardSnapshot)
+        .where(LeaderboardSnapshot.wxid == wxid)
+        .order_by(LeaderboardSnapshot.date.asc())
+    )).scalars().all()
+
+    history = [
+        {"date": s.date, "avg_mult": s.avg_mult, "win_rate": s.win_rate, "ca_count": s.ca_count}
+        for s in snaps
+    ]
+
+    # 跟单配置
+    follow = (await db.execute(
+        _sel(FollowTrader).where(FollowTrader.wxid == wxid)
+    )).scalar_one_or_none()
+    follow_cfg = None
+    if follow:
+        follow_cfg = {
+            "enabled": follow.enabled, "buy_amount": follow.buy_amount,
+            "take_profit": follow.take_profit, "stop_loss": follow.stop_loss,
+            "max_hold_min": follow.max_hold_min, "note": follow.note,
+        }
+
+    return {"wxid": wxid, "history": history, "follow": follow_cfg}
+
+

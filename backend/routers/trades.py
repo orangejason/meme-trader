@@ -5,9 +5,22 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from database import get_db, Trade, CaFeed, TokenDetail
+from datetime import datetime, timedelta, timezone
 import json
 
 router = APIRouter(prefix="/api/trades", tags=["trades"])
+
+
+def _period_cutoff(period: str) -> datetime | None:
+    """返回 UTC 截止时间，period='all' 返回 None"""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return {
+        "hour":  now - timedelta(hours=1),
+        "day":   now - timedelta(days=1),
+        "week":  now - timedelta(weeks=1),
+        "month": now - timedelta(days=30),
+        "year":  now - timedelta(days=365),
+    }.get(period)
 
 
 async def _get_token_meta_batch(db: AsyncSession, cas: list[str]) -> dict[str, dict]:
@@ -74,23 +87,29 @@ async def get_trade_history(
 
 
 @router.get("/stats")
-async def get_trade_stats(db: AsyncSession = Depends(get_db)):
-    """统计数据：总盈亏、胜率等（只统计有真实 tx 的交易）"""
+async def get_trade_stats(
+    period: str = Query("all", regex="^(hour|day|week|month|year|all)$"),
+    db: AsyncSession = Depends(get_db),
+):
+    """统计数据：总盈亏、胜率等（只统计有真实 tx 的交易）支持时段过滤"""
     result = await db.execute(select(Trade))
     trades = result.scalars().all()
-
-    # 只统计有真实链上 tx 的交易（buy_tx 不为空）
     trades = [t for t in trades if getattr(t, 'buy_tx', '') or getattr(t, 'sell_tx', '')]
 
+    # 按时段过滤
+    cutoff = _period_cutoff(period)
+    if cutoff:
+        trades = [t for t in trades if t.close_time and t.close_time >= cutoff]
+
+    empty = {
+        "total_trades": 0, "win_trades": 0, "loss_trades": 0,
+        "win_rate": 0, "total_pnl_usdt": 0, "total_invested": 0,
+        "total_gas_usd": 0, "avg_win": 0, "avg_loss": 0,
+        "max_win": 0, "max_loss": 0, "profit_factor": None,
+        "best_streak": 0, "worst_streak": 0, "period": period,
+    }
     if not trades:
-        return {
-            "total_trades": 0,
-            "win_trades": 0,
-            "loss_trades": 0,
-            "win_rate": 0,
-            "total_pnl_usdt": 0,
-            "total_invested": 0,
-        }
+        return empty
 
     total = len(trades)
     wins = sum(1 for t in trades if t.pnl_usdt > 0)
@@ -98,14 +117,45 @@ async def get_trade_stats(db: AsyncSession = Depends(get_db)):
     total_invested = sum(t.amount_usdt for t in trades)
     total_gas = sum(getattr(t, 'gas_fee_usd', 0) or 0 for t in trades)
 
+    win_pnls  = [t.pnl_usdt for t in trades if t.pnl_usdt > 0]
+    loss_pnls = [t.pnl_usdt for t in trades if t.pnl_usdt <= 0]
+
+    avg_win  = round(sum(win_pnls)  / len(win_pnls),  4) if win_pnls  else 0
+    avg_loss = round(sum(loss_pnls) / len(loss_pnls), 4) if loss_pnls else 0
+    max_win  = round(max(win_pnls),  4) if win_pnls  else 0
+    max_loss = round(min(loss_pnls), 4) if loss_pnls else 0
+
+    # 盈利因子 = 总盈利 / 总亏损绝对值
+    total_win_sum  = sum(win_pnls)
+    total_loss_abs = abs(sum(loss_pnls)) if loss_pnls else 0
+    profit_factor  = round(total_win_sum / total_loss_abs, 2) if total_loss_abs > 0 else None
+
+    # 最长连胜/连败
+    best_streak = worst_streak = cur_w = cur_l = 0
+    for t in sorted(trades, key=lambda x: x.close_time):
+        if t.pnl_usdt > 0:
+            cur_w += 1; cur_l = 0
+        else:
+            cur_l += 1; cur_w = 0
+        best_streak  = max(best_streak,  cur_w)
+        worst_streak = max(worst_streak, cur_l)
+
     return {
-        "total_trades": total,
-        "win_trades": wins,
-        "loss_trades": total - wins,
-        "win_rate": round(wins / total * 100, 1),
+        "total_trades":   total,
+        "win_trades":     wins,
+        "loss_trades":    total - wins,
+        "win_rate":       round(wins / total * 100, 1),
         "total_pnl_usdt": round(total_pnl, 4),
         "total_invested": round(total_invested, 4),
-        "total_gas_usd": round(total_gas, 4),
+        "total_gas_usd":  round(total_gas, 4),
+        "avg_win":        avg_win,
+        "avg_loss":       avg_loss,
+        "max_win":        max_win,
+        "max_loss":       max_loss,
+        "profit_factor":  profit_factor,
+        "best_streak":    best_streak,
+        "worst_streak":   worst_streak,
+        "period":         period,
     }
 
 

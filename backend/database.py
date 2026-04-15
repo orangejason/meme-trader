@@ -33,6 +33,11 @@ class Position(Base):
     current_price: Mapped[float] = mapped_column(Float, default=0.0)
     status: Mapped[str] = mapped_column(String(16), default="open")
     gas_fee_usd: Mapped[float] = mapped_column(Float, default=0.0)  # 买入 gas 成本（USD）
+    # 跟单参数（0=使用全局配置）
+    follow_take_profit: Mapped[float] = mapped_column(Float, default=0.0)
+    follow_stop_loss:   Mapped[float] = mapped_column(Float, default=0.0)
+    follow_max_hold_min: Mapped[int]  = mapped_column(Integer, default=0)
+    follow_wxid:        Mapped[str]   = mapped_column(String(128), default="")  # 跟单喊单人 wxid
 
 
 class Trade(Base):
@@ -157,6 +162,35 @@ class SenderStats(Base):
     last_seen: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class FollowTrader(Base):
+    """跟单配置：记录每个喊单人的跟单设置"""
+    __tablename__ = "follow_traders"
+    id:           Mapped[int]   = mapped_column(Integer, primary_key=True, autoincrement=True)
+    wxid:         Mapped[str]   = mapped_column(String(128), unique=True, index=True)
+    name:         Mapped[str]   = mapped_column(String(128), default="")
+    enabled:      Mapped[bool]  = mapped_column(Boolean, default=True)
+    buy_amount:   Mapped[float] = mapped_column(Float, default=0.1)     # 跟单金额 USDT
+    take_profit:  Mapped[float] = mapped_column(Float, default=50.0)    # 止盈 %
+    stop_loss:    Mapped[float] = mapped_column(Float, default=30.0)    # 止损 %
+    max_hold_min: Mapped[int]   = mapped_column(Integer, default=60)    # 最长持仓分钟
+    note:         Mapped[str]   = mapped_column(String(256), default="")
+    created_at:   Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at:   Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class LeaderboardSnapshot(Base):
+    """每日牛人榜快照，用于 7 日收益率曲线"""
+    __tablename__ = "leaderboard_snapshots"
+    id:           Mapped[int]   = mapped_column(Integer, primary_key=True, autoincrement=True)
+    wxid:         Mapped[str]   = mapped_column(String(128), index=True)
+    name:         Mapped[str]   = mapped_column(String(128), default="")
+    date:         Mapped[str]   = mapped_column(String(16), index=True)   # "2026-04-14"
+    avg_mult:     Mapped[float] = mapped_column(Float, default=0.0)       # total_multiplier / ca_count
+    win_rate:     Mapped[float] = mapped_column(Float, default=0.0)       # today_win_rate %
+    ca_count:     Mapped[int]   = mapped_column(Integer, default=0)
+    created_at:   Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class TokenDetail(Base):
     """
     AVE API 拉取的链上详情缓存 —— 24小时内不重复拉取
@@ -234,6 +268,7 @@ async def init_db():
             "ave_data_api_url": "https://ave-api.cloud",
             "gas_price_multiplier": "1.0",
             "approve_gas_price_gwei": "1.0",
+            "broadcast_mode": "ave",
             "buy_amount_fallback_enabled": "true",
             "buy_amount_fallback_usdt": "1",
             "filter_honeypot_unknown_action": "skip",
@@ -241,6 +276,19 @@ async def init_db():
             "ca_repeat_qwfc_delta": "20",
             "buy_precheck_enabled": "true",
             "buy_fail_cooldown_seconds": "300",
+            "auto_buy_enabled": "false",         # 信息流自动购买：过滤通过后是否自动买入（不依赖跟单）
+            "leaderboard_batch_follow_enabled": "false",  # 一键牛人榜跟单：牛人榜显示批量跟单按钮
+            "buy_with_bnb_fallback_enabled": "false",      # BNB代替USDT：USDT不足时自动用等值BNB买入（仅BSC）
+            # AI 接口配置
+            "ai_use_builtin": "true",          # 是否使用内置共享 Key
+            "ai_builtin_daily_limit": "50",    # 内置 Key 每日次数上限
+            "ai_provider": "openai",
+            "ai_model": "",
+            "ai_api_key": "",
+            "ai_base_url": "",
+            "ai_enabled": "false",
+            "ai_max_tokens": "1024",
+            "ai_temperature": "0.7",
         }
         for key, value in defaults.items():
             result = await session.execute(select(ConfigModel).where(ConfigModel.key == key))

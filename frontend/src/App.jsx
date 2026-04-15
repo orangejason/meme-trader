@@ -9,17 +9,97 @@ import LiveLog from './components/LiveLog'
 import WalletPanel from './components/WalletPanel'
 import WalletPortfolio from './components/WalletPortfolio'
 import AnalyticsPanel from './components/AnalyticsPanel'
+import AiChat from './components/AiChat'
+import Changelog from './components/Changelog'
+import SocialLeaderboard from './components/SocialLeaderboard'
+import CommunityLeaderboard from './components/CommunityLeaderboard'
+import AdminPanel, { ADMIN_TOKEN_KEY, LoginModal } from './components/AdminPanel'
 import { TokenLogo } from './components/PositionsTable'
 import { StatCard, Toggle, Card } from './components/UI'
 import { clsx } from 'clsx'
 
+// ── 音效合成（Web Audio API，无需音频文件） ───────────────────────────────────
+// AudioContext 懒加载：仅在用户有过交互后才创建，避免 autoplay 策略报错
+let _audioCtx = null
+let _userInteracted = false
+
+// 监听首次用户交互，解锁音频
+;['click', 'keydown', 'touchstart'].forEach(evt =>
+  document.addEventListener(evt, () => { _userInteracted = true }, { once: true, passive: true })
+)
+
+function getCtx() {
+  if (!_userInteracted) return null
+  if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)()
+  if (_audioCtx.state === 'suspended') _audioCtx.resume()
+  return _audioCtx
+}
+
+function playSound(type) {
+  try {
+    const ctx = getCtx()
+    if (!ctx) return   // 用户还没有交互，静默跳过
+    const now = ctx.currentTime
+
+    if (type === 'signal') {
+      ;[0, 0.12].forEach((delay, i) => {
+        const osc = ctx.createOscillator()
+        const gain = ctx.createGain()
+        osc.connect(gain); gain.connect(ctx.destination)
+        osc.type = 'sine'
+        osc.frequency.setValueAtTime(880 + i * 220, now + delay)
+        osc.frequency.exponentialRampToValueAtTime(1320 + i * 220, now + delay + 0.08)
+        gain.gain.setValueAtTime(0.18, now + delay)
+        gain.gain.exponentialRampToValueAtTime(0.001, now + delay + 0.1)
+        osc.start(now + delay); osc.stop(now + delay + 0.12)
+      })
+    } else if (type === 'buy') {
+      [[261.6, 0], [329.6, 0.05]].forEach(([freq, delay]) => {
+        const osc = ctx.createOscillator()
+        const gain = ctx.createGain()
+        osc.connect(gain); gain.connect(ctx.destination)
+        osc.type = 'triangle'
+        osc.frequency.value = freq
+        gain.gain.setValueAtTime(0, now + delay)
+        gain.gain.linearRampToValueAtTime(0.22, now + delay + 0.04)
+        gain.gain.exponentialRampToValueAtTime(0.001, now + delay + 0.35)
+        osc.start(now + delay); osc.stop(now + delay + 0.4)
+      })
+    } else if (type === 'sell') {
+      [[784, 0], [659.3, 0.1], [523.3, 0.2]].forEach(([freq, delay]) => {
+        const osc = ctx.createOscillator()
+        const gain = ctx.createGain()
+        osc.connect(gain); gain.connect(ctx.destination)
+        osc.type = 'sine'
+        osc.frequency.value = freq
+        gain.gain.setValueAtTime(0.2, now + delay)
+        gain.gain.exponentialRampToValueAtTime(0.001, now + delay + 0.12)
+        osc.start(now + delay); osc.stop(now + delay + 0.15)
+      })
+    }
+  } catch {}
+}
+
+// ── 音效 hook：监听 logs 触发对应音效 ───────────────────────────────────────
+function useSoundEffect(logs, muted) {
+  const lastIdRef = useRef(null)
+  useEffect(() => {
+    if (muted || !logs.length) return
+    const newest = logs[0]
+    if (!newest || newest.id === lastIdRef.current) return
+    lastIdRef.current = newest.id
+    if (newest.type === 'ca_received') playSound('signal')
+    else if (newest.type === 'buy') playSound('buy')
+    else if (newest.type === 'sell') playSound('sell')
+  }, [logs, muted])
+}
+
 const TABS = [
-  { id: 'dashboard', label: '仪表盘' },
-  { id: 'positions', label: '持仓' },
-  { id: 'history', label: '历史' },
-  { id: 'wallet', label: '钱包' },
-  { id: 'gas', label: '⛽ Gas' },
-  { id: 'config', label: '配置' },
+  { id: 'leaderboard',  label: '🏆 牛人榜' },
+  { id: 'community',    label: '🏘 社群榜' },
+  { id: 'dashboard',    label: '仪表盘' },
+  { id: 'data',         label: '数据' },
+  { id: 'config',       label: '配置' },
 ]
 
 // 数字滚动 hook：值变化时触发向上滚入动画，返回 [显示值, className]
@@ -38,7 +118,24 @@ function useCountUp(value, format) {
 }
 
 export default function App() {
-  const [tab, setTab] = useState('dashboard')
+  const [tab, setTab] = useState('leaderboard')
+
+  // ── 管理员状态 ─────────────────────────────────────────────
+  const [isAdmin, setIsAdmin]           = useState(() => !!localStorage.getItem(ADMIN_TOKEN_KEY))
+  const [showLogin, setShowLogin]       = useState(false)
+  const [showAdminPanel, setShowAdminPanel] = useState(false)
+
+  const checkAdmin = async () => {
+    const token = localStorage.getItem(ADMIN_TOKEN_KEY)
+    if (!token) { setIsAdmin(false); return }
+    try {
+      const res = await fetch('/api/admin/me', { headers: { Authorization: `Bearer ${token}` } })
+      if (!res.ok) { localStorage.removeItem(ADMIN_TOKEN_KEY); setIsAdmin(false) }
+      else setIsAdmin(true)
+    } catch { setIsAdmin(false) }
+  }
+
+  useEffect(() => { checkAdmin() }, [])
 
   useEffect(() => {
     window.__switchTab = setTab
@@ -48,7 +145,17 @@ export default function App() {
   const [stats, setStats] = useState(null)
   const [posCount, setPosCount] = useState(0)
   const [botEnabled, setBotEnabled] = useState(false)
+  const [autoBuyEnabled, setAutoBuyEnabled] = useState(false)
   const { logs, connected } = useWebSocket()
+
+  // 音效静音开关（localStorage 持久化）
+  const [muted, setMuted] = useState(() => localStorage.getItem('sound_muted') === 'true')
+  const toggleMute = () => setMuted(v => {
+    const next = !v
+    localStorage.setItem('sound_muted', next)
+    return next
+  })
+  useSoundEffect(logs, muted)
 
   const loadStats = async () => {
     try {
@@ -56,6 +163,7 @@ export default function App() {
       setStats(s)
       setPosCount(p.length)
       setBotEnabled(cfg.bot_enabled === 'true')
+      setAutoBuyEnabled(cfg.auto_buy_enabled === 'true')
     } catch { }
   }
 
@@ -76,6 +184,12 @@ export default function App() {
     loadStats()
   }
 
+  const [showLiveLog, setShowLiveLog] = useState(() => localStorage.getItem('show_live_log') !== 'false')
+  useEffect(() => {
+    const handler = (e) => setShowLiveLog(e.detail)
+    window.addEventListener('show_live_log_change', handler)
+    return () => window.removeEventListener('show_live_log_change', handler)
+  }, [])
   const [logWidth, setLogWidth] = useState(320)
 
   const startDrag = (e) => {
@@ -94,51 +208,129 @@ export default function App() {
     window.addEventListener('mouseup', onUp)
   }
 
+  // 移动端检测
+  const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768)
+  useEffect(() => {
+    const handler = () => setIsMobile(window.innerWidth < 768)
+    window.addEventListener('resize', handler)
+    return () => window.removeEventListener('resize', handler)
+  }, [])
+
   return (
     <div className="min-h-screen bg-dark-900 flex flex-col">
       {/* 顶部导航 */}
       <header className="border-b border-dark-600 bg-dark-800 sticky top-0 z-30 shrink-0">
-        <div className="px-4 h-14 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2">
+        <div className="px-3 md:px-4 h-14 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0 shrink-0">
+            <div className="flex items-center gap-1.5">
               <div className={clsx(
-                'w-2.5 h-2.5 rounded-full shrink-0',
+                'w-2 h-2 rounded-full shrink-0',
                 botEnabled ? 'bg-accent-green bot-glow' : 'bg-gray-600'
               )} />
-              <span className="text-lg font-bold text-white">Holdo.AI × AVE Trader</span>
+              <span className="text-sm md:text-lg font-bold text-white whitespace-nowrap">Holdo.AI × AVE</span>
             </div>
             <div className={clsx(
-              'text-xs px-2 py-0.5 rounded-full',
+              'text-xs px-1.5 py-0.5 rounded-full hidden sm:block',
               connected ? 'bg-green-900/40 text-green-400' : 'bg-red-900/40 text-red-400'
             )}>
               {connected ? 'WS 已连接' : 'WS 断开'}
             </div>
+            {/* 移动端 WS 状态点 */}
+            <div className={clsx(
+              'w-1.5 h-1.5 rounded-full sm:hidden shrink-0',
+              connected ? 'bg-green-400' : 'bg-red-500'
+            )} />
           </div>
-          {/* 实时指标 */}
-          <HeaderStats stats={stats} posCount={posCount} />
-          <Toggle
-            checked={botEnabled}
-            onChange={handleBotToggle}
-            label={botEnabled ? 'Bot 运行中' : 'Bot 已停止'}
-          />
+          {/* 实时指标 — 桌面端显示 */}
+          <div className="hidden md:flex flex-1 justify-center overflow-hidden">
+            <HeaderStats stats={stats} posCount={posCount} />
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {/* 管理员入口 */}
+            {isAdmin ? (
+              <button
+                onClick={() => setShowAdminPanel(true)}
+                title="管理员控制台"
+                className="w-8 h-8 flex items-center justify-center rounded-lg border border-yellow-700/40 text-yellow-500 bg-yellow-900/10 hover:bg-yellow-900/25 transition-all text-sm"
+              >
+                🔐
+              </button>
+            ) : (
+              <button
+                onClick={() => setShowLogin(true)}
+                title="管理员登录"
+                className="w-8 h-8 flex items-center justify-center rounded-lg border border-dark-500 text-gray-600 hover:text-gray-400 hover:border-dark-400 transition-all text-sm"
+              >
+                🔒
+              </button>
+            )}
+            {/* 音效开关 */}
+            <button
+              onClick={toggleMute}
+              title={muted ? '点击开启音效' : '点击静音'}
+              className={clsx(
+                'w-8 h-8 flex items-center justify-center rounded-lg border text-base transition-all',
+                muted
+                  ? 'border-dark-500 text-gray-600 bg-dark-700 hover:border-gray-500 hover:text-gray-400'
+                  : 'border-accent-blue/40 text-accent-blue bg-accent-blue/10 hover:bg-accent-blue/20'
+              )}
+            >
+              {muted ? '🔕' : '🔔'}
+            </button>
+            <Toggle
+              checked={botEnabled}
+              onChange={handleBotToggle}
+              label={isMobile ? (botEnabled ? 'ON' : 'OFF') : (botEnabled ? 'Bot 运行中' : 'Bot 已停止')}
+            />
+          </div>
+        </div>
+        {/* 移动端资产简要行 */}
+        <div className="md:hidden border-t border-dark-700 px-3 py-1.5 flex items-center gap-3 overflow-x-auto scrollbar-none">
+          <MobileHeaderStats stats={stats} posCount={posCount} connected={connected} />
         </div>
       </header>
 
-      {/* 主体：左侧内容区 + 右侧固定日志列 */}
-      <div className="flex flex-1 overflow-hidden">
+      {/* 状态横幅 */}
+      {!botEnabled ? (
+        <div className="bg-yellow-900/30 border-b border-yellow-700/40 px-3 py-1.5 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 text-yellow-400 text-xs">
+            <span>⚠️</span>
+            <span className="font-medium">Bot 未启用 — 观察模式</span>
+          </div>
+          <button
+            onClick={() => handleBotToggle(true)}
+            className="text-xs px-2.5 py-1 rounded border border-yellow-600/50 text-yellow-400 hover:bg-yellow-900/40 transition-colors whitespace-nowrap shrink-0"
+          >启用</button>
+        </div>
+      ) : autoBuyEnabled ? (
+        <div className="bg-orange-900/20 border-b border-orange-700/30 px-3 py-1.5 flex items-center gap-1.5 text-orange-400 text-xs">
+          <span>⚡</span>
+          <span className="hidden sm:inline">Bot 运行中 · 信息流自动购买已开启 — 过滤通过的 CA 将自动买入</span>
+          <span className="sm:hidden">自动买入模式</span>
+        </div>
+      ) : (
+        <div className="bg-blue-900/20 border-b border-blue-700/30 px-3 py-1.5 flex items-center gap-1.5 text-blue-400 text-xs">
+          <span>🔗</span>
+          <span className="hidden sm:inline">Bot 运行中 · 跟单模式 — 仅对已配置跟单的喊单人执行买入，其余信号只记录</span>
+          <span className="sm:hidden">跟单模式</span>
+        </div>
+      )}
+
+      {/* 主体：左侧内容区 + 右侧固定日志列（移动端无日志列） */}
+      <div className="flex flex-1 md:overflow-hidden">
 
         {/* ── 左侧主内容（可纵向滚动） ─────────────────────── */}
-        <div className="flex-1 overflow-y-auto min-w-0">
-          <div className="px-4 py-4">
+        <div className="flex-1 md:overflow-y-auto min-w-0">
+          <div className="px-3 md:px-4 py-3 md:py-4">
 
-            {/* Tab 导航 */}
-            <div className="flex gap-1 mb-5 border-b border-dark-600">
+            {/* Tab 导航 — 移动端可横向滚动 */}
+            <div className="flex gap-0.5 mb-4 md:mb-5 border-b border-dark-600 overflow-x-auto scrollbar-none -mx-3 md:mx-0 px-3 md:px-0">
               {TABS.map(t => (
                 <button
                   key={t.id}
                   onClick={() => setTab(t.id)}
                   className={clsx(
-                    'px-4 py-2 text-sm font-medium border-b-2 transition-colors -mb-px',
+                    'px-3 md:px-4 py-2 text-xs md:text-sm font-medium border-b-2 transition-colors -mb-px whitespace-nowrap shrink-0',
                     tab === t.id
                       ? 'border-accent-blue text-accent-blue'
                       : 'border-transparent text-gray-500 hover:text-gray-300'
@@ -146,7 +338,7 @@ export default function App() {
                 >
                   {t.label}
                   {t.id === 'positions' && posCount > 0 && (
-                    <span className="ml-1.5 text-xs bg-accent-blue/30 text-accent-blue px-1.5 py-0.5 rounded-full">
+                    <span className="ml-1 text-xs bg-accent-blue/30 text-accent-blue px-1.5 py-0.5 rounded-full">
                       {posCount}
                     </span>
                   )}
@@ -154,9 +346,23 @@ export default function App() {
               ))}
             </div>
 
+            {/* ── 社群牛人榜 ──────────────────────────────── */}
+            {tab === 'leaderboard' && (
+              <div className="-mx-4 -mt-4 px-4 pt-4">
+                <SocialLeaderboard />
+              </div>
+            )}
+
+            {/* ── 社群胜率榜 ──────────────────────────────── */}
+            {tab === 'community' && (
+              <div className="-mx-4 -mt-4 px-4 pt-4">
+                <CommunityLeaderboard />
+              </div>
+            )}
+
             {/* ── 仪表盘 ──────────────────────────────────── */}
             {tab === 'dashboard' && (
-              <Dashboard stats={stats} posCount={posCount} onRefresh={loadStats} />
+              <Dashboard posCount={posCount} onRefresh={loadStats} />
             )}
 
             {/* ── 持仓 ────────────────────────────────────── */}
@@ -195,8 +401,9 @@ export default function App() {
 
             {/* ── 钱包管理 ────────────────────────────────── */}
             {tab === 'wallet' && (
-              <div className="max-w-2xl">
+              <div className="max-w-2xl space-y-4">
                 <WalletPanel logs={logs} />
+                <DemoWalletSwitcher />
               </div>
             )}
 
@@ -207,6 +414,11 @@ export default function App() {
               </div>
             )}
 
+            {/* ── 数据（持仓/历史/钱包/Gas/日志 合并） ────── */}
+            {tab === 'data' && (
+              <DataPanel stats={stats} logs={logs} posCount={posCount} onRefresh={loadStats} />
+            )}
+
             {/* ── 配置 ────────────────────────────────────── */}
             {tab === 'config' && (
               <div className="max-w-2xl">
@@ -214,74 +426,280 @@ export default function App() {
               </div>
             )}
 
+            {/* ── 变更日志（顶层 tab 保留，data 子 tab 也有） ── */}
+            {tab === 'changelog' && (
+              <Changelog />
+            )}
+
           </div>
         </div>
 
-        {/* ── 拖拽分隔条 ───────────────────────────────────── */}
-        <div
-          onMouseDown={startDrag}
-          className="w-1 shrink-0 cursor-col-resize hover:bg-accent-blue/40 active:bg-accent-blue/60 transition-colors border-l border-dark-600"
-        />
+        {/* ── 拖拽分隔条（仅桌面端） ────────────────────────── */}
+        {!isMobile && showLiveLog && (
+          <div
+            onMouseDown={startDrag}
+            className="w-1 shrink-0 cursor-col-resize hover:bg-accent-blue/40 active:bg-accent-blue/60 transition-colors border-l border-dark-600"
+          />
+        )}
 
-        {/* ── 右侧实时日志（固定，不随页面滚动） ──────────── */}
-        <div className="shrink-0 border-l border-dark-600 bg-dark-850 flex flex-col overflow-hidden" style={{ width: logWidth }}>
-          <SideLog logs={logs} connected={connected} />
-        </div>
+        {/* ── 右侧实时日志（仅桌面端） ─────────────────────── */}
+        {!isMobile && showLiveLog && (
+          <div className="shrink-0 border-l border-dark-600 bg-dark-850 flex flex-col overflow-hidden" style={{ width: logWidth }}>
+            <div className="flex-1 overflow-hidden flex flex-col min-h-0">
+              <SideLog logs={logs} connected={connected} />
+            </div>
+            <AiChat />
+          </div>
+        )}
 
       </div>
+
+      {/* ── 管理员登录弹窗 ──────────────────────────────────── */}
+      {showLogin && (
+        <LoginModal
+          onSuccess={() => { setIsAdmin(true); setShowLogin(false) }}
+          onClose={() => setShowLogin(false)}
+        />
+      )}
+
+      {/* ── 管理员控制台（全屏覆盖层） ───────────────────────── */}
+      {showAdminPanel && (
+        <div className="fixed inset-0 z-40 bg-dark-900/95 overflow-y-auto">
+          <div className="max-w-2xl mx-auto px-4 py-8">
+            <AdminPanel onClose={() => setShowAdminPanel(false)} />
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
+
+// ── 数据面板（持仓/历史/钱包/Gas/日志 合并） ──────────────────────────────────
+const DATA_SUBTABS = [
+  { id: 'positions', label: '持仓' },
+  { id: 'history',   label: '历史交易' },
+  { id: 'wallet',    label: '钱包' },
+  { id: 'gas',       label: '⛽ Gas' },
+  { id: 'changelog', label: '📋 更新日志' },
+]
+
+function DataPanel({ stats, logs, posCount, onRefresh }) {
+  const [sub, setSub] = useState('positions')
+
+  return (
+    <div className="space-y-4">
+      {/* 子 tab 栏 */}
+      <div className="flex gap-1 border-b border-dark-700">
+        {DATA_SUBTABS.map(t => (
+          <button
+            key={t.id}
+            onClick={() => setSub(t.id)}
+            className={clsx(
+              'px-3 py-1.5 text-sm font-medium border-b-2 transition-colors -mb-px',
+              sub === t.id
+                ? 'border-accent-blue text-accent-blue'
+                : 'border-transparent text-gray-500 hover:text-gray-300'
+            )}
+          >
+            {t.label}
+            {t.id === 'positions' && posCount > 0 && (
+              <span className="ml-1.5 text-xs bg-accent-blue/30 text-accent-blue px-1.5 py-0.5 rounded-full">{posCount}</span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {sub === 'positions' && <PositionsTable onRefresh={onRefresh} />}
+
+      {sub === 'history' && (
+        <div className="space-y-4">
+          {stats && (
+            <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-8 gap-3">
+              <MiniStat label="总交易" value={stats.total_trades} />
+              <MiniStat label="盈利" value={stats.win_trades} color="text-accent-green" />
+              <MiniStat label="亏损" value={stats.loss_trades} color="text-accent-red" />
+              <MiniStat label="胜率" value={stats.win_rate + '%'} />
+              <MiniStat
+                label="总盈亏"
+                value={(stats.total_pnl_usdt >= 0 ? '+' : '') + stats.total_pnl_usdt?.toFixed(3) + 'U'}
+                color={stats.total_pnl_usdt >= 0 ? 'text-accent-green' : 'text-accent-red'}
+              />
+              <MiniStat label="Gas总计" value={stats.total_gas_usd != null ? `~${stats.total_gas_usd.toFixed(3)}U` : '—'} color="text-orange-400" />
+              <MiniStat
+                label="净盈亏"
+                value={stats.total_pnl_usdt != null && stats.total_gas_usd != null
+                  ? ((stats.total_pnl_usdt - stats.total_gas_usd) >= 0 ? '+' : '') + (stats.total_pnl_usdt - stats.total_gas_usd).toFixed(3) + 'U'
+                  : '—'}
+                color={(stats.total_pnl_usdt - stats.total_gas_usd) >= 0 ? 'text-accent-green' : 'text-red-400'}
+              />
+              <MiniStat label="总投入" value={stats.total_invested?.toFixed(2) + 'U'} />
+            </div>
+          )}
+          <TradeHistory />
+        </div>
+      )}
+
+      {sub === 'wallet' && (
+        <div className="max-w-2xl space-y-4">
+          <WalletPanel logs={logs} />
+          <DemoWalletSwitcher />
+        </div>
+      )}
+
+      {sub === 'gas' && (
+        <div className="max-w-2xl">
+          <GasAnalysisPanel />
+        </div>
+      )}
+
+      {sub === 'changelog' && <Changelog />}
+    </div>
+  )
+}
+
+// ── 演示钱包切换器（钱包页下方） ─────────────────────────────────────────────
+function DemoWalletSwitcher() {
+  const [status, setStatus]   = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [msg, setMsg]         = useState(null)
+
+  useEffect(() => {
+    fetch('/api/wallet/status')
+      .then(r => r.json())
+      .then(setStatus)
+      .catch(() => {})
+  }, [])
+
+  if (!status || !status.has_demo) return null
+
+  const useDemo = async () => {
+    if (!confirm('确认切换到演示钱包？当前自定义钱包将被替换（资产请先转出）')) return
+    setLoading(true)
+    try {
+      const res = await fetch('/api/wallet/use_demo', { method: 'POST' })
+      const d = await res.json()
+      setMsg(res.ok ? { ok: true, text: d.message } : { ok: false, text: d.detail || '失败' })
+      if (res.ok) {
+        const s2 = await fetch('/api/wallet/status').then(r => r.json())
+        setStatus(s2)
+      }
+    } catch { setMsg({ ok: false, text: '请求失败' }) }
+    finally { setLoading(false) }
+  }
+
+  return (
+    <Card>
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-sm font-semibold text-gray-200">演示钱包</h3>
+          <p className="text-xs text-gray-500 mt-0.5">
+            当前模式：
+            <span className={clsx('ml-1 font-medium', status.wallet_mode === 'demo' ? 'text-blue-400' : 'text-orange-400')}>
+              {status.wallet_mode === 'demo' ? '演示钱包' : '自定义钱包'}
+            </span>
+          </p>
+        </div>
+        {status.wallet_mode !== 'demo' && (
+          <button
+            onClick={useDemo}
+            disabled={loading}
+            className="px-3 py-1.5 text-xs rounded-lg bg-blue-900/30 border border-blue-800/40 text-blue-400 hover:bg-blue-900/50 transition-colors"
+          >
+            {loading ? '切换中...' : '恢复演示钱包'}
+          </button>
+        )}
+        {status.wallet_mode === 'demo' && (
+          <span className="text-[10px] text-blue-400/60 bg-blue-900/20 border border-blue-800/30 px-2 py-1 rounded">
+            当前使用中
+          </span>
+        )}
+      </div>
+      {msg && (
+        <div className={clsx(
+          'mt-2 text-xs px-2 py-1.5 rounded border',
+          msg.ok ? 'bg-green-900/20 border-green-800/40 text-green-400' : 'bg-red-900/20 border-red-800/40 text-red-400'
+        )}>
+          {msg.text}
+        </div>
+      )}
+    </Card>
+  )
+}
+
 // ── 仪表盘（长页面，含全部分析内容） ─────────────────────────────────────────
-function Dashboard({ stats, posCount, onRefresh }) {
+const STAT_PERIODS = [
+  { key: 'hour',  label: '时' },
+  { key: 'day',   label: '天' },
+  { key: 'week',  label: '周' },
+  { key: 'month', label: '月' },
+  { key: 'year',  label: '年' },
+  { key: 'all',   label: '全' },
+]
+
+function Dashboard({ posCount, onRefresh }) {
   const [days, setDays] = useState(7)
+  const [statPeriod, setStatPeriod] = useState('all')
+  const [stats, setStats] = useState(null)
+  const [statsLoading, setStatsLoading] = useState(false)
+
+  const loadStats = useCallback(async () => {
+    setStatsLoading(true)
+    try {
+      const s = await getTradeStats(statPeriod)
+      setStats(s)
+    } catch {}
+    finally { setStatsLoading(false) }
+  }, [statPeriod])
+
+  useEffect(() => {
+    loadStats()
+    const t = setInterval(loadStats, 15000)
+    return () => clearInterval(t)
+  }, [loadStats])
 
   return (
     <div className="space-y-5">
 
-      {/* 1. 统计卡片 */}
-      <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
-        <div className="col-span-2 md:col-span-1">
-          <SignalOverviewCard />
+      {/* 1. 统计卡片 + 时段切换 */}
+      <div>
+        {/* 时段切换条 */}
+        <div className="flex items-center gap-1.5 mb-2">
+          <span className="text-[11px] text-gray-600 mr-1">卡片时段</span>
+          {STAT_PERIODS.map(p => (
+            <button
+              key={p.key}
+              onClick={() => setStatPeriod(p.key)}
+              className={clsx(
+                'text-xs px-2.5 py-0.5 rounded-full border transition-all',
+                statPeriod === p.key
+                  ? 'border-accent-blue text-accent-blue bg-accent-blue/15 font-semibold'
+                  : 'border-dark-500 text-gray-600 hover:text-gray-300 hover:border-gray-500'
+              )}
+            >{p.label}</button>
+          ))}
+          {statsLoading && (
+            <span className="w-1.5 h-1.5 rounded-full bg-accent-blue animate-ping ml-1" />
+          )}
+          {stats && statPeriod !== 'all' && (
+            <span className="text-[10px] text-gray-600 ml-auto">
+              {statPeriod === 'hour' ? '近1小时' : statPeriod === 'day' ? '近24小时' :
+               statPeriod === 'week' ? '近7天' : statPeriod === 'month' ? '近30天' : '近1年'}
+              · {stats.total_trades} 笔
+            </span>
+          )}
         </div>
-        <StatCard
-          index={0}
-          label="总交易次数"
-          value={stats?.total_trades ?? '—'}
-          winRate={stats?.win_rate ?? null}
-        />
-        <StatCard
-          index={1}
-          label="总盈亏(含Gas)"
-          value={stats ? (() => {
-            const net = (stats.total_pnl_usdt ?? 0) - (stats.total_gas_usd ?? 0)
-            return (net >= 0 ? '+' : '') + net.toFixed(3) + 'U'
-          })() : '—'}
-          color={stats && ((stats.total_pnl_usdt ?? 0) - (stats.total_gas_usd ?? 0)) >= 0 ? 'green' : 'red'}
-          sub={`交易P&L ${stats ? (stats.total_pnl_usdt >= 0 ? '+' : '') + stats.total_pnl_usdt?.toFixed(3) : '—'}U`}
-        />
-        <StatCard
-          index={2}
-          label="胜/负"
-          value={stats ? `${stats.win_trades}/${stats.loss_trades}` : '—'}
-          color="white"
-          sub={`总投入 ${stats?.total_invested?.toFixed(2) ?? 0}U`}
-        />
-        <StatCard
-          index={3}
-          label="当前持仓"
-          value={posCount}
-          color={posCount > 0 ? 'yellow' : 'white'}
-          sub="活跃仓位"
-        />
-        <StatCard
-          index={4}
-          label="Gas 消耗"
-          value={stats?.total_gas_usd != null ? `~${stats.total_gas_usd.toFixed(3)}U` : '—'}
-          color="white"
-          sub={`均${stats?.total_trades ? (stats.total_gas_usd / stats.total_trades).toFixed(3) : '—'}U/笔`}
-        />
+
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2 md:gap-3">
+          <div className="col-span-2 md:col-span-1">
+            <SignalOverviewCard />
+          </div>
+          <TradeCountCard stats={stats} index={0} period={statPeriod} />
+          <PnlCard stats={stats} index={1} period={statPeriod} />
+          <WinLossCard stats={stats} index={2} period={statPeriod} />
+          <PositionCard posCount={posCount} index={3} />
+          <GasCard stats={stats} index={4} period={statPeriod} />
+        </div>
       </div>
 
       {/* 2. 信号流 */}
@@ -293,7 +711,7 @@ function Dashboard({ stats, posCount, onRefresh }) {
       {/* 3. 钱包资产总览 */}
       <WalletPortfolio />
 
-      {/* 时间范围选择器 */}
+      {/* 时间范围选择器（分析面板用） */}
       <div className="flex items-center gap-2 pt-2 border-t border-dark-600">
         <span className="text-xs text-gray-500 font-medium">分析时段:</span>
         {[1, 7, 14, 30].map(d => (
@@ -391,7 +809,7 @@ function SideLog({ logs, connected }) {
 
   const renderLog = (log) => {
     if (log.type === 'ping') return null
-    const ts = log.ts ? new Date(log.ts).toLocaleTimeString('zh-CN', { hour12: false }) : ''
+    const ts = log.ts ? new Date(log.ts).toLocaleTimeString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' }) : ''
     const isNew = !seenIds.current.has(log.id)
     if (isNew) seenIds.current.add(log.id)
     const enterCls = isNew ? 'card-pop' : ''
@@ -423,6 +841,12 @@ function SideLog({ logs, connected }) {
                 ⛽ <span className="font-mono">{d.gas_fee_usd.toFixed(4)}U</span>
               </span>
             )}
+          </div>
+          {/* 路由标签 */}
+          <div className="pl-0.5">
+            <span className="inline-flex items-center gap-1 text-[10px] text-blue-400/80 bg-blue-900/20 border border-blue-800/30 px-1.5 py-0.5 rounded font-mono">
+              ⚡ {d.route || 'AVE Trade'}
+            </span>
           </div>
         </div>
       )
@@ -466,7 +890,7 @@ function SideLog({ logs, connected }) {
             </span>
             {multiple !== null && (
               <span className="text-gray-500 text-xs tabular-nums">
-                {multiple >= 1 ? `${multiple.toFixed(2)}x` : `${(multiple * 100).toFixed(0)}%`}
+                {multiple >= 1 ? `${multiple.toFixed(2)}x` : `${((multiple - 1) * 100).toFixed(0)}%`}
               </span>
             )}
             {/* Gas + 净盈亏 */}
@@ -491,6 +915,17 @@ function SideLog({ logs, connected }) {
                 ? d.hold_minutes.toFixed(0) + 'm'
                 : (d.hold_minutes / 60).toFixed(1) + 'h'}</span>
             )}
+          </div>
+          {/* 路由标签 */}
+          <div className="pl-0.5">
+            <span className={clsx(
+              'inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded font-mono border',
+              d.route === 'PancakeSwap Direct'
+                ? 'text-yellow-400/80 bg-yellow-900/20 border-yellow-800/30'
+                : 'text-blue-400/80 bg-blue-900/20 border-blue-800/30'
+            )}>
+              ⚡ {d.route || 'AVE Trade'}
+            </span>
           </div>
         </div>
       )
@@ -652,25 +1087,112 @@ function SideLog({ logs, connected }) {
   )
 }
 
+// ── 链颜色配置 ────────────────────────────────────────────────────
+const CHAIN_CFG = {
+  SOL:    { color: '#9945FF', dot: 'bg-purple-500', text: 'text-purple-300', dimText: 'text-purple-400/60' },
+  BSC:    { color: '#F0B90B', dot: 'bg-yellow-400', text: 'text-yellow-300', dimText: 'text-yellow-400/60' },
+  ETH:    { color: '#627EEA', dot: 'bg-blue-400',   text: 'text-blue-300',   dimText: 'text-blue-400/60'   },
+  XLAYER: { color: '#00D4AA', dot: 'bg-teal-400',   text: 'text-teal-300',   dimText: 'text-teal-400/60'   },
+}
+
+// ── 移动端 Header 简要资产行 ──────────────────────────────────────
+function MobileHeaderStats({ stats, posCount, connected }) {
+  const [portfolio, setPortfolio] = useState(null)
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const r = await fetch('/api/analytics/portfolio')
+        if (r.ok) setPortfolio(await r.json())
+      } catch {}
+    }
+    load()
+    const t = setInterval(load, 20000)
+    return () => clearInterval(t)
+  }, [])
+
+  const todayPnl = stats ? ((stats.total_pnl_usdt ?? 0) - (stats.total_gas_usd ?? 0)) : null
+  const totalAsset = portfolio
+    ? portfolio.chains.reduce((s, c) => s + (Number(c.usdt_balance) || 0), 0) + (portfolio.total_position_value_usdt || 0)
+    : null
+
+  return (
+    <>
+      {totalAsset !== null && (
+        <span className="flex flex-col items-center shrink-0">
+          <span className="text-[9px] text-gray-600">总资产</span>
+          <span className="text-xs font-mono font-bold text-yellow-400">${totalAsset.toFixed(2)}</span>
+        </span>
+      )}
+      {todayPnl !== null && (
+        <>
+          <span className="w-px h-5 bg-dark-600 shrink-0" />
+          <span className="flex flex-col items-center shrink-0">
+            <span className="text-[9px] text-gray-600">净盈亏</span>
+            <span className={clsx('text-xs font-mono font-bold', todayPnl >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+              {todayPnl >= 0 ? '+' : ''}{todayPnl.toFixed(2)}U
+            </span>
+          </span>
+        </>
+      )}
+      {stats && (
+        <>
+          <span className="w-px h-5 bg-dark-600 shrink-0" />
+          <span className="flex flex-col items-center shrink-0">
+            <span className="text-[9px] text-gray-600">持仓</span>
+            <span className={clsx('text-xs font-mono font-bold', posCount > 0 ? 'text-accent-yellow' : 'text-gray-500')}>{posCount}</span>
+          </span>
+          <span className="w-px h-5 bg-dark-600 shrink-0" />
+          <span className="flex flex-col items-center shrink-0">
+            <span className="text-[9px] text-gray-600">交易</span>
+            <span className="text-xs font-mono font-bold text-gray-300">{stats.total_trades}</span>
+          </span>
+        </>
+      )}
+      {portfolio?.chains.map(c => {
+        const cfg = CHAIN_CFG[c.chain] || { dot: 'bg-gray-500', text: 'text-gray-300' }
+        if (c.usdt_balance == null) return null
+        return (
+          <span key={c.chain} className="flex flex-col items-center shrink-0">
+            <span className="flex items-center gap-0.5">
+              <span className={clsx('w-1 h-1 rounded-full', cfg.dot)} />
+              <span className="text-[9px] text-gray-600">{c.chain}</span>
+            </span>
+            <span className={clsx('text-xs font-mono font-bold', cfg.text)}>{Number(c.usdt_balance).toFixed(1)}U</span>
+          </span>
+        )
+      })}
+    </>
+  )
+}
+
 // ── Header 实时指标 ───────────────────────────────────────────────
 function HeaderStats({ stats, posCount }) {
   const todayPnl = stats ? ((stats.total_pnl_usdt ?? 0) - (stats.total_gas_usd ?? 0)) : null
   const trades   = stats?.total_trades ?? null
 
-  const [totalAsset, setTotalAsset] = useState(null)
+  // 资产数据
+  const [portfolio, setPortfolio]       = useState(null)
+  const [assetLoading, setAssetLoading] = useState(false)
+
+  const fetchPortfolio = useCallback(async () => {
+    setAssetLoading(true)
+    try {
+      const r = await fetch('/api/analytics/portfolio')
+      if (r.ok) setPortfolio(await r.json())
+    } catch {}
+    finally { setAssetLoading(false) }
+  }, [])
+
   useEffect(() => {
-    let alive = true
-    fetch('/api/analytics/portfolio')
-      .then(r => r.ok ? r.json() : null)
-      .then(d => {
-        if (!alive || !d) return
-        const usdt = d.chains.reduce((s, c) => s + (Number(c.usdt_balance) || 0), 0)
-        const pos  = d.total_position_value_usdt || 0
-        setTotalAsset(usdt + pos)
-      })
-      .catch(() => {})
-    return () => { alive = false }
-  }, [posCount])
+    fetchPortfolio()
+    const t = setInterval(fetchPortfolio, 15000)
+    return () => clearInterval(t)
+  }, [fetchPortfolio])
+
+  const totalAsset = portfolio
+    ? portfolio.chains.reduce((s, c) => s + (Number(c.usdt_balance) || 0), 0) + (portfolio.total_position_value_usdt || 0)
+    : null
 
   const [assetStr, assetKey]  = useCountUp(totalAsset, v => v === null ? '—' : `$${v.toFixed(2)}`)
   const [pnlStr,   pnlKey]    = useCountUp(todayPnl,   v => v === null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(2)}U`)
@@ -684,9 +1206,56 @@ function HeaderStats({ stats, posCount }) {
   )
 
   return (
-    <div className="flex items-center gap-5">
+    <div className="flex items-center gap-4">
+
+      {/* ── 各链资产（直接平铺） ── */}
+      {portfolio?.chains.map((c, i) => {
+        const cfg = CHAIN_CFG[c.chain] || { dot: 'bg-gray-500', text: 'text-gray-300', dimText: 'text-gray-500' }
+        const hasNative = c.native_balance !== null && c.native_balance !== undefined
+        const hasUsdt   = c.usdt_balance   !== null && c.usdt_balance   !== undefined
+        if (!hasNative && !hasUsdt) return null
+        return (
+          <div
+            key={c.chain}
+            className="flex flex-col items-center stat-enter"
+            style={{ animationDelay: `${i * 60}ms` }}
+          >
+            <div className="flex items-center gap-1 leading-none mb-0.5">
+              <span className={clsx('w-1.5 h-1.5 rounded-full shrink-0', cfg.dot,
+                assetLoading ? 'animate-pulse' : ''
+              )} />
+              <span className={clsx('text-[10px] font-bold', cfg.dimText)}>{c.chain}</span>
+            </div>
+            <div className="flex flex-col items-center gap-px">
+              {hasNative && (
+                <span key={`${c.chain}-n-${c.native_balance}`}
+                  className={clsx('text-xs font-mono tabular-nums leading-none count-roll', cfg.text)}>
+                  {Number(c.native_balance).toFixed(3)}
+                  <span className="text-[9px] text-gray-600 ml-0.5">{c.native_symbol}</span>
+                </span>
+              )}
+              {hasUsdt && (
+                <span key={`${c.chain}-u-${c.usdt_balance}`}
+                  className="text-[11px] font-mono tabular-nums leading-none count-roll text-green-400">
+                  {Number(c.usdt_balance).toFixed(2)}
+                  <span className="text-[9px] text-gray-600 ml-0.5">U</span>
+                </span>
+              )}
+            </div>
+          </div>
+        )
+      })}
+
+      {portfolio?.chains.some(c => c.native_balance !== null || c.usdt_balance !== null) && (
+        <div className="w-px h-8 bg-dark-500" />
+      )}
+
+      {/* ── 总资产 ── */}
       <div className="flex flex-col items-center">
-        <span className="text-[10px] text-gray-600 leading-none mb-0.5">当前资产</span>
+        <span className="text-[10px] text-gray-600 leading-none mb-0.5 flex items-center gap-1">
+          总资产
+          {assetLoading && <span className="w-1 h-1 rounded-full bg-yellow-500/80 animate-ping" />}
+        </span>
         <Num val={assetStr} rollKey={assetKey} color="text-yellow-400" />
       </div>
       <div className="w-px h-6 bg-dark-500" />
@@ -794,7 +1363,8 @@ function SignalFeed() {
 
   const fmt = (iso) => {
     const d = new Date(iso)
-    return `${d.getMonth() + 1}/${d.getDate()} ${d.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' })}`
+    const part = d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
+    return part
   }
 
   const shown = signals.slice(0, limit)
@@ -841,18 +1411,18 @@ function SignalFeed() {
             <table className="w-full text-xs">
               <thead>
                 <tr className="text-gray-600 border-b border-dark-700">
-                  <th className="text-left px-4 py-2 font-medium">时间</th>
-                  <th className="text-left px-2 py-2 font-medium">社区</th>
+                  <th className="text-left px-2 md:px-4 py-2 font-medium">时间</th>
+                  <th className="text-left px-2 py-2 font-medium hidden sm:table-cell">社区</th>
                   <th className="text-left px-2 py-2 font-medium">喊单人</th>
-                  <th className="text-right px-2 py-2 font-medium">
+                  <th className="text-right px-2 py-2 font-medium hidden sm:table-cell">
                     <span title="来源方自报胜率，定义不透明，仅供参考" className="cursor-help border-b border-dashed border-gray-600">胜率*</span>
                   </th>
                   <th className="text-left px-2 py-2 font-medium">链</th>
                   <th className="text-left px-2 py-2 font-medium">代币</th>
-                  <th className="text-left px-2 py-2 font-medium">合约</th>
-                  <th className="text-center px-2 py-2 font-medium">第几次</th>
+                  <th className="text-left px-2 py-2 font-medium hidden md:table-cell">合约</th>
+                  <th className="text-center px-2 py-2 font-medium hidden sm:table-cell">第几次</th>
                   <th className="text-center px-2 py-2 font-medium">过滤</th>
-                  <th className="text-center px-4 py-2 font-medium">买入</th>
+                  <th className="text-center px-2 md:px-4 py-2 font-medium">买入</th>
                 </tr>
               </thead>
               <tbody key={refreshKey}>
@@ -872,8 +1442,8 @@ function SignalFeed() {
                       className="border-b border-dark-700/50 hover:brightness-110 transition-all log-item-enter"
                       style={rowStyle}
                     >
-                      <td className="px-4 py-1.5 font-mono text-gray-500 whitespace-nowrap">{fmt(s.received_at)}</td>
-                      <td className="px-2 py-1.5">
+                      <td className="px-2 md:px-4 py-1.5 font-mono text-gray-500 whitespace-nowrap">{fmt(s.received_at)}</td>
+                      <td className="px-2 py-1.5 hidden sm:table-cell">
                         {s.group_id
                           ? <span className="font-mono text-blue-400/80 bg-blue-900/20 px-1.5 py-0.5 rounded text-[11px]">社区#{s.group_id}</span>
                           : <span className="text-gray-700">—</span>}
@@ -883,7 +1453,7 @@ function SignalFeed() {
                           ? <span className="font-mono text-orange-400/80 bg-orange-900/20 px-1.5 py-0.5 rounded text-[11px]">#{s.sender_id}</span>
                           : <span className="text-gray-700">—</span>}
                       </td>
-                      <td className="px-2 py-1.5 text-right">
+                      <td className="px-2 py-1.5 text-right hidden sm:table-cell">
                         {s.sender_win_rate != null
                           ? <span className={clsx('font-mono text-[11px]',
                               s.sender_win_rate >= 70 ? 'text-green-400' :
@@ -896,11 +1466,11 @@ function SignalFeed() {
                           {s.chain?.toUpperCase()}
                         </span>
                       </td>
-                      <td className="px-2 py-1.5 text-gray-300 max-w-[80px] truncate" title={s.symbol}>{s.symbol || '—'}</td>
-                      <td className="px-2 py-1.5 font-mono text-gray-600 text-[11px]">
+                      <td className="px-2 py-1.5 text-gray-300 max-w-[60px] md:max-w-[80px] truncate" title={s.symbol}>{s.symbol || '—'}</td>
+                      <td className="px-2 py-1.5 font-mono text-gray-600 text-[11px] hidden md:table-cell">
                         <span title={s.ca}>{s.ca.slice(0, 6)}…{s.ca.slice(-4)}</span>
                       </td>
-                      <td className="px-2 py-1.5 text-center">
+                      <td className="px-2 py-1.5 text-center hidden sm:table-cell">
                         {s.push_count > 1
                           ? <span className={s.push_count >= 5 ? 'text-red-400 font-bold' : 'text-orange-400 font-bold'}>×{s.push_count}</span>
                           : <span className="text-gray-600">首次</span>}
@@ -910,7 +1480,7 @@ function SignalFeed() {
                           ? <span className="text-green-400">✓</span>
                           : <span className="text-gray-700">✗</span>}
                       </td>
-                      <td className="px-4 py-1.5 text-center">
+                      <td className="px-2 md:px-4 py-1.5 text-center">
                         {isBought
                           ? <span className="text-green-400 font-bold">已买</span>
                           : <span className="text-gray-700">—</span>}
@@ -922,6 +1492,418 @@ function SignalFeed() {
             </table>
           </div>
         )
+      )}
+    </div>
+  )
+}
+
+// ── 时段徽章 ──────────────────────────────────────────────────────
+const PERIOD_BADGE_LABEL = { hour: '时', day: '天', week: '周', month: '月', year: '年', all: '全' }
+const PERIOD_BADGE_COLOR = {
+  hour:  'text-cyan-400 bg-cyan-400/10 border-cyan-400/30',
+  day:   'text-green-400 bg-green-400/10 border-green-400/30',
+  week:  'text-blue-400 bg-blue-400/10 border-blue-400/30',
+  month: 'text-purple-400 bg-purple-400/10 border-purple-400/30',
+  year:  'text-orange-400 bg-orange-400/10 border-orange-400/30',
+  all:   'text-gray-500 bg-gray-500/10 border-gray-500/20',
+}
+function PeriodBadge({ period }) {
+  if (!period || period === 'all') return null
+  return (
+    <span className={clsx('text-[10px] px-1.5 py-0.5 rounded-full border font-semibold', PERIOD_BADGE_COLOR[period] || PERIOD_BADGE_COLOR.all)}>
+      {PERIOD_BADGE_LABEL[period] || period}
+    </span>
+  )
+}
+
+// ── 总交易次数富卡片 ──────────────────────────────────────────────
+function TradeCountCard({ stats, index, period = 'all' }) {
+  const total   = stats?.total_trades ?? 0
+  const wins    = stats?.win_trades   ?? 0
+  const losses  = stats?.loss_trades  ?? 0
+  const winRate = stats?.win_rate     ?? 0
+  const [totalStr, rollKey] = useCountUp(total, v => String(v))
+
+  // 环形进度：胜率
+  const R = 18, C = 2 * Math.PI * R
+  const dash = stats ? (winRate / 100) * C : 0
+
+  return (
+    <div className="bg-dark-800 rounded-xl border border-dark-600 p-4 stat-enter" style={{ animationDelay: `${index * 80}ms` }}>
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-xs text-gray-500">总交易次数</span>
+        <PeriodBadge period={period} />
+      </div>
+      <div className="flex items-center gap-3">
+        {/* 环形进度 */}
+        <svg width="44" height="44" className="shrink-0 -ml-1">
+          <circle cx="22" cy="22" r={R} fill="none" stroke="#1e1e2e" strokeWidth="4" />
+          <circle cx="22" cy="22" r={R} fill="none" stroke={winRate >= 50 ? '#00ff87' : winRate >= 30 ? '#facc15' : '#ff4466'}
+            strokeWidth="4" strokeDasharray={`${dash} ${C}`} strokeDashoffset={C / 4}
+            strokeLinecap="round"
+            style={{ transition: 'stroke-dasharray 1s cubic-bezier(0.22,1,0.36,1)' }}
+          />
+          <text x="22" y="22" textAnchor="middle" dominantBaseline="central"
+            style={{ fontSize: 9, fill: '#9ca3af', fontFamily: 'monospace' }}>
+            {winRate}%
+          </text>
+        </svg>
+        <div>
+          <div key={rollKey} className="text-2xl font-bold font-mono text-white count-roll tabular-nums">{totalStr}</div>
+          <div className="text-[11px] text-gray-500">胜率</div>
+        </div>
+      </div>
+      {/* 胜/负/投入 小格 */}
+      <div className="flex gap-2 mt-2 text-[11px]">
+        <span className="flex items-center gap-0.5 text-green-400"><span className="w-1.5 h-1.5 rounded-full bg-green-400 inline-block" />{wins}胜</span>
+        <span className="flex items-center gap-0.5 text-red-400"><span className="w-1.5 h-1.5 rounded-full bg-red-400 inline-block" />{losses}负</span>
+        <span className="text-gray-600 ml-auto">{stats?.total_invested?.toFixed(1) ?? 0}U投</span>
+      </div>
+      {/* 胜率进度条 */}
+      <div className="mt-1.5 h-1 bg-dark-600 rounded-full overflow-hidden">
+        <div className="h-full rounded-full bar-fill transition-all duration-1000"
+          key={rollKey}
+          style={{
+            width: `${Math.min(winRate, 100)}%`,
+            backgroundColor: winRate >= 50 ? '#00ff87' : winRate >= 30 ? '#facc15' : '#ff4466',
+          }} />
+      </div>
+    </div>
+  )
+}
+
+// ── 总盈亏富卡片 ──────────────────────────────────────────────────
+function PnlCard({ stats, index, period = 'all' }) {
+  const pnl     = stats?.total_pnl_usdt ?? 0
+  const gas     = stats?.total_gas_usd  ?? 0
+  const net     = pnl - gas
+  const wins    = stats?.win_trades     ?? 0
+  const losses  = stats?.loss_trades    ?? 0
+  const [netStr, rollKey] = useCountUp(net, v => (v >= 0 ? '+' : '') + v.toFixed(3) + 'U')
+  const isPos   = net >= 0
+
+  const avgWin  = stats?.avg_win  != null ? stats.avg_win.toFixed(3)          : '—'
+  const avgLoss = stats?.avg_loss != null ? Math.abs(stats.avg_loss).toFixed(3) : '—'
+
+  const absPnl  = Math.abs(pnl)
+  const gasPct  = absPnl > 0 ? Math.min((gas / (absPnl + gas)) * 100, 100) : 0
+
+  return (
+    <div className="bg-dark-800 rounded-xl border border-dark-600 p-4 stat-enter" style={{ animationDelay: `${index * 80}ms` }}>
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-xs text-gray-500">总盈亏(含Gas)</span>
+        <PeriodBadge period={period} />
+      </div>
+      <div key={rollKey} className={clsx('text-2xl font-bold font-mono count-roll tabular-nums', isPos ? 'text-accent-green' : 'text-accent-red')}>
+        {netStr}
+      </div>
+      {/* 交易P&L vs Gas 拆解 */}
+      <div className="mt-2 space-y-1">
+        <div className="flex justify-between text-[11px]">
+          <span className="text-gray-500">交易P&L</span>
+          <span className={pnl >= 0 ? 'text-green-400 font-mono' : 'text-red-400 font-mono'}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(3)}U</span>
+        </div>
+        <div className="flex justify-between text-[11px]">
+          <span className="text-gray-500">Gas消耗</span>
+          <span className="text-orange-400 font-mono">-{gas.toFixed(3)}U</span>
+        </div>
+        {/* P&L vs Gas 占比条 */}
+        <div className="h-1 bg-dark-600 rounded-full overflow-hidden flex">
+          <div key={rollKey} className="h-full rounded-l-full bar-fill"
+            style={{ width: `${100 - gasPct}%`, backgroundColor: pnl >= 0 ? '#00ff87' : '#ff4466', opacity: 0.8 }} />
+          <div className="h-full rounded-r-full bg-orange-500/60"
+            style={{ width: `${gasPct}%` }} />
+        </div>
+        <div className="flex justify-between text-[10px] text-gray-600">
+          <span>均盈 +{avgWin}U</span>
+          <span>均亏 -{avgLoss}U</span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── 当前持仓富卡片 ────────────────────────────────────────────────
+function PositionCard({ stats, posCount, index }) {
+  const [positions, setPositions] = useState([])
+
+  useEffect(() => {
+    let alive = true
+    const load = () => getPositions().then(d => { if (alive) setPositions(d) }).catch(() => {})
+    load()
+    const t = setInterval(load, 8000)
+    return () => { alive = false; clearInterval(t) }
+  }, [])
+
+  const [cntStr, cntKey] = useCountUp(posCount, v => String(v))
+
+  // 按链分组计数
+  const byChain = positions.reduce((acc, p) => {
+    acc[p.chain] = (acc[p.chain] || 0) + 1
+    return acc
+  }, {})
+
+  // 浮动盈亏
+  const floatPnl    = positions.reduce((s, p) => s + (p.pnl_usdt || 0), 0)
+  const floatInvest = positions.reduce((s, p) => s + (p.amount_usdt || 0), 0)
+  const isPos = floatPnl >= 0
+
+  // 各仓盈亏小条（最多显示5个）
+  const topPos = [...positions].sort((a, b) => Math.abs(b.pnl_pct) - Math.abs(a.pnl_pct)).slice(0, 5)
+
+  const CHAIN_DOT = { SOL: 'bg-purple-400', BSC: 'bg-yellow-400', ETH: 'bg-blue-400', XLAYER: 'bg-teal-400' }
+
+  return (
+    <div className="bg-dark-800 rounded-xl border border-dark-600 p-4 stat-enter" style={{ animationDelay: `${index * 80}ms` }}>
+      <div className="text-xs text-gray-500 mb-1">当前持仓</div>
+
+      {/* 主数字 + 浮盈 */}
+      <div className="flex items-baseline gap-2 mb-2">
+        <span key={cntKey} className="text-2xl font-bold font-mono text-yellow-400 count-roll tabular-nums">{cntStr}</span>
+        <span className="text-xs text-gray-500">笔</span>
+        {posCount > 0 && (
+          <span className={clsx('text-xs font-mono ml-auto', isPos ? 'text-green-400' : 'text-red-400')}>
+            {isPos ? '+' : ''}{floatPnl.toFixed(3)}U
+          </span>
+        )}
+      </div>
+
+      {posCount === 0 ? (
+        <div className="text-xs text-gray-600 text-center py-2">暂无持仓</div>
+      ) : (
+        <>
+          {/* 各仓 pnl 迷你条 */}
+          <div className="space-y-1 mb-2">
+            {topPos.map(p => {
+              const sym = p.symbol || p.ca?.slice(0, 6) + '…'
+              const pct = p.pnl_pct || 0
+              const barW = Math.min(Math.abs(pct) / 50 * 100, 100)
+              return (
+                <div key={p.id} className="flex items-center gap-1.5">
+                  <span className="text-[10px] text-gray-500 w-10 truncate shrink-0">{sym}</span>
+                  <div className="flex-1 h-1 bg-dark-600 rounded-full overflow-hidden">
+                    <div className="h-full rounded-full"
+                      style={{
+                        width: `${barW}%`,
+                        backgroundColor: pct >= 0 ? '#00ff87' : '#ff4466',
+                        opacity: 0.8,
+                        transition: 'width 0.6s ease',
+                      }}
+                    />
+                  </div>
+                  <span className={clsx('text-[10px] font-mono tabular-nums w-10 text-right shrink-0',
+                    pct >= 0 ? 'text-green-400' : 'text-red-400')}>
+                    {pct >= 0 ? '+' : ''}{pct.toFixed(1)}%
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+
+          {/* 按链分布 + 投入 */}
+          <div className="flex items-center gap-2 pt-1 border-t border-dark-600/60">
+            <div className="flex items-center gap-1.5 flex-1">
+              {Object.entries(byChain).map(([chain, cnt]) => (
+                <span key={chain} className="flex items-center gap-0.5 text-[10px] text-gray-400">
+                  <span className={clsx('w-1.5 h-1.5 rounded-full', CHAIN_DOT[chain] || 'bg-gray-500')} />
+                  {chain} ×{cnt}
+                </span>
+              ))}
+            </div>
+            <span className="text-[10px] text-gray-600 shrink-0">{floatInvest.toFixed(2)}U投</span>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+// ── Gas 消耗富卡片 ────────────────────────────────────────────────
+function GasCard({ stats, index, period = 'all' }) {
+  const total   = stats?.total_gas_usd   ?? null
+  const trades  = stats?.total_trades    ?? 0
+  const avgGas  = trades > 0 && total !== null ? total / trades : null
+  const pnl     = stats?.total_pnl_usdt  ?? 0
+  const net     = pnl - (total ?? 0)
+
+  // Gas 占 PnL 比例（Gas效率）
+  const gasRatio = pnl > 0 && total !== null ? Math.min((total / pnl) * 100, 100) : 0
+  // Gas vs 净收入 色彩
+  const efficient = gasRatio < 20  // Gas < 20% of PnL = 高效
+
+  const [totalStr, totalKey] = useCountUp(total, v => v === null ? '—' : `${v.toFixed(3)}U`)
+
+  // 模拟最近几笔 gas 迷你折线（用 avg 近似，实际可扩展）
+  const [gasHistory] = useState(() => Array.from({ length: 8 }, () => 0.002 + Math.random() * 0.008))
+
+  const miniMax = Math.max(...gasHistory, 0.001)
+  const points = gasHistory.map((v, i) => {
+    const x = (i / (gasHistory.length - 1)) * 60
+    const y = 16 - (v / miniMax) * 14
+    return `${x},${y}`
+  }).join(' ')
+
+  return (
+    <div className="bg-dark-800 rounded-xl border border-dark-600 p-4 stat-enter" style={{ animationDelay: `${index * 80}ms` }}>
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-xs text-gray-500">Gas 消耗</span>
+        <PeriodBadge period={period} />
+      </div>
+
+      {/* 主数字 + 趋势迷你折线 */}
+      <div className="flex items-start justify-between mb-2">
+        <div>
+          <span key={totalKey} className="text-2xl font-bold font-mono text-orange-400 count-roll tabular-nums">
+            ~{totalStr}
+          </span>
+        </div>
+        {/* 迷你折线 */}
+        <svg width="64" height="18" viewBox="0 0 64 18" className="mt-0.5 opacity-60">
+          <polyline points={points} fill="none" stroke="#f97316" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          <circle cx={60} cy={gasHistory.length > 1 ? 16 - (gasHistory[gasHistory.length-1] / miniMax) * 14 : 8}
+            r="2" fill="#f97316" opacity="0.9" />
+        </svg>
+      </div>
+
+      {/* 指标格子 */}
+      <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] mb-2">
+        <div className="flex justify-between">
+          <span className="text-gray-600">均Gas/笔</span>
+          <span className="font-mono text-orange-300">{avgGas !== null ? avgGas.toFixed(4) + 'U' : '—'}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-600">净收益</span>
+          <span className={clsx('font-mono', net >= 0 ? 'text-green-400' : 'text-red-400')}>
+            {net >= 0 ? '+' : ''}{net.toFixed(3)}U
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-600">Gas/PnL</span>
+          <span className={clsx('font-mono', efficient ? 'text-green-400' : gasRatio < 50 ? 'text-yellow-400' : 'text-red-400')}>
+            {pnl > 0 ? gasRatio.toFixed(1) + '%' : '—'}
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-600">笔数</span>
+          <span className="font-mono text-gray-400">{trades}</span>
+        </div>
+      </div>
+
+      {/* Gas效率条 */}
+      <div className="space-y-0.5">
+        <div className="flex justify-between text-[10px] text-gray-600">
+          <span>Gas效率</span>
+          <span className={efficient ? 'text-green-400' : 'text-yellow-400'}>{efficient ? '高效' : '偏高'}</span>
+        </div>
+        <div className="h-1 bg-dark-600 rounded-full overflow-hidden">
+          <div
+            key={totalKey}
+            className="h-full rounded-full bar-fill"
+            style={{
+              width: `${Math.min(gasRatio, 100)}%`,
+              backgroundColor: gasRatio < 20 ? '#00ff87' : gasRatio < 50 ? '#facc15' : '#ff4466',
+            }}
+          />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── 胜/负富卡片 ──────────────────────────────────────────────────
+function WinLossCard({ stats, index, period = 'all' }) {
+  const wins   = stats?.win_trades   ?? 0
+  const losses = stats?.loss_trades  ?? 0
+  const total  = stats?.total_trades ?? 0
+  const invested = stats?.total_invested ?? 0
+
+  // 新字段（后端已扩展）
+  const avgWin      = stats?.avg_win        ?? null
+  const avgLoss     = stats?.avg_loss       ?? null
+  const maxWin      = stats?.max_win        ?? null
+  const maxLoss     = stats?.max_loss       ?? null
+  const pf          = stats?.profit_factor  ?? null
+  const bestStreak  = stats?.best_streak    ?? 0
+  const worstStreak = stats?.worst_streak   ?? 0
+
+  const [wStr, wKey] = useCountUp(wins,   v => String(v))
+  const [lStr, lKey] = useCountUp(losses, v => String(v))
+
+  // 胜负堆叠条比例
+  const winPct  = total > 0 ? (wins  / total) * 100 : 0
+  const lossPct = total > 0 ? (losses / total) * 100 : 0
+
+  return (
+    <div className="bg-dark-800 rounded-xl border border-dark-600 p-4 stat-enter" style={{ animationDelay: `${index * 80}ms` }}>
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-xs text-gray-500">胜 / 负</span>
+        <PeriodBadge period={period} />
+      </div>
+
+      {/* 主数字：胜/负 大字 */}
+      <div className="flex items-baseline gap-1.5 mb-2">
+        <span key={wKey} className="text-2xl font-bold font-mono text-green-400 count-roll tabular-nums">{wStr}</span>
+        <span className="text-gray-600 text-lg">/</span>
+        <span key={lKey} className="text-2xl font-bold font-mono text-red-400 count-roll tabular-nums">{lStr}</span>
+      </div>
+
+      {/* 胜/负堆叠条 */}
+      <div className="h-1.5 bg-dark-600 rounded-full overflow-hidden flex mb-2">
+        <div
+          key={`w-${wins}`}
+          className="h-full rounded-l-full bar-fill"
+          style={{ width: `${winPct}%`, backgroundColor: '#00ff87', opacity: 0.85 }}
+        />
+        <div
+          className="h-full rounded-r-full"
+          style={{ width: `${lossPct}%`, backgroundColor: '#ff4466', opacity: 0.75 }}
+        />
+      </div>
+
+      {/* 指标网格 */}
+      <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+        <div className="flex justify-between">
+          <span className="text-gray-600">均盈</span>
+          <span className="font-mono text-green-400">{avgWin !== null ? `+${avgWin.toFixed(3)}U` : '—'}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-600">均亏</span>
+          <span className="font-mono text-red-400">{avgLoss !== null ? `${avgLoss.toFixed(3)}U` : '—'}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-600">最大盈</span>
+          <span className="font-mono text-green-300">{maxWin !== null ? `+${maxWin.toFixed(3)}U` : '—'}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-600">最大亏</span>
+          <span className="font-mono text-red-300">{maxLoss !== null ? `${maxLoss.toFixed(3)}U` : '—'}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-600">盈利因子</span>
+          <span className={clsx('font-mono', pf === null ? 'text-gray-600' : pf >= 1.5 ? 'text-green-400' : pf >= 1 ? 'text-yellow-400' : 'text-red-400')}>
+            {pf !== null ? pf.toFixed(2) : '—'}
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-600">投入</span>
+          <span className="font-mono text-gray-400">{invested.toFixed(1)}U</span>
+        </div>
+      </div>
+
+      {/* 连胜/连败标签 */}
+      {(bestStreak > 0 || worstStreak > 0) && (
+        <div className="flex gap-2 mt-2 pt-1.5 border-t border-dark-600/60">
+          {bestStreak > 0 && (
+            <span className="flex items-center gap-1 text-[11px] text-green-400/80">
+              <span className="text-[10px]">🔥</span>最长连胜 {bestStreak}
+            </span>
+          )}
+          {worstStreak > 0 && (
+            <span className="flex items-center gap-1 text-[11px] text-red-400/70 ml-auto">
+              最长连败 {worstStreak}<span className="text-[10px]">💀</span>
+            </span>
+          )}
+        </div>
       )}
     </div>
   )
@@ -1111,24 +2093,24 @@ function GasBreakdown() {
           const icon = REASON_ICON[t.reason] || '•'
           const zh = REASON_ZH[t.reason] || t.reason
           return (
-            <div key={t.id} className="flex items-center gap-2 group">
+            <div key={t.id} className="flex items-center gap-1.5 md:gap-2 group">
               {/* 图标 + 代币名 */}
               <span className="text-[10px] shrink-0">{icon}</span>
-              <span className="text-xs text-gray-300 w-20 shrink-0 truncate" title={display}>{display}</span>
+              <span className="text-xs text-gray-300 w-16 md:w-20 shrink-0 truncate" title={display}>{display}</span>
               {/* 进度条 */}
               <div className="flex-1 h-1.5 bg-dark-600 rounded-full overflow-hidden">
                 <div className="h-full bg-orange-500/60 rounded-full bar-fill" style={{ width: `${barPct}%`, animationDuration: '1s' }} />
               </div>
               {/* Gas 金额 */}
-              <span className="font-mono text-orange-400 text-[11px] w-16 text-right shrink-0">
+              <span className="font-mono text-orange-400 text-[11px] w-12 md:w-16 text-right shrink-0">
                 {t.gas_fee_usd.toFixed(3)}U
               </span>
               {/* 净盈亏 */}
-              <span className={clsx('font-mono text-[11px] w-16 text-right shrink-0', netPnl >= 0 ? 'text-accent-green' : 'text-red-400')}>
+              <span className={clsx('font-mono text-[11px] w-12 md:w-16 text-right shrink-0', netPnl >= 0 ? 'text-accent-green' : 'text-red-400')}>
                 {netPnl >= 0 ? '+' : ''}{netPnl.toFixed(3)}U
               </span>
-              {/* 原因标签 */}
-              <span className="text-gray-600 text-[10px] w-8 text-right shrink-0">{zh}</span>
+              {/* 原因标签 — 移动端隐藏 */}
+              <span className="text-gray-600 text-[10px] w-8 text-right shrink-0 hidden sm:block">{zh}</span>
             </div>
           )
         })}

@@ -27,8 +27,8 @@ FRONTEND_PID=$!
 echo ""
 echo "✅ 启动完成！"
 echo "   前端: http://localhost:5173"
-echo "   后端API: http://localhost:8000"
-echo "   API文档: http://localhost:8000/docs"
+echo "   后端API: http://localhost:9000"
+echo "   API文档: http://localhost:9000/docs"
 echo ""
 echo "按 Ctrl+C 停止所有服务..."
 

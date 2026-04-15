@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { getConfig, updateConfig, getTradeHistory, getTradeStats } from '../api'
+import { getAiConfig, saveAiConfig } from '../api'
 import { Card, Button, Toggle } from './UI'
 import { clsx } from 'clsx'
 
@@ -58,6 +59,8 @@ const FILTER_DEFAULTS = {
 export default function ConfigPanel({ onConfigSaved }) {
   const [cfg, setCfg] = useState({
     bot_enabled: 'false',
+    auto_buy_enabled: 'false',
+    leaderboard_batch_follow_enabled: 'false',
     buy_amount_usdt: '2',
     take_profit_pct: '50',
     stop_loss_pct: '30',
@@ -68,10 +71,12 @@ export default function ConfigPanel({ onConfigSaved }) {
     position_price_source: 'cached',
     gas_price_multiplier: '1.0',
     approve_gas_price_gwei: '1.0',
+    broadcast_mode: 'ave',
     buy_amount_fallback_enabled: 'true',
     buy_amount_fallback_usdt: '1',
     buy_precheck_enabled: 'true',
     buy_fail_cooldown_seconds: '300',
+    buy_with_bnb_fallback_enabled: 'false',
     ave_trade_api_key: '',
     ave_trade_api_url: 'https://bot-api.ave.ai',
     ave_data_api_key: 'SW59NmZFRG2yfRSSWvKlzTuAuZBFl5SUUCV2DUX5rg5eK8n6sipMlLkwXCX5qHGw',
@@ -81,8 +86,32 @@ export default function ConfigPanel({ onConfigSaved }) {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
 
+  // AI 接口配置（独立状态，通过 AI config API 读写）
+  const [aiCfg, setAiCfg] = useState({
+    enabled: false,
+    use_builtin: true,
+    builtin_available: false,
+    builtin_daily_limit: 50,
+    builtin_used_today: 0,
+    builtin_remaining: 50,
+    provider: 'cometapi',
+    model: '',
+    api_key_set: false,
+    base_url: '',
+    max_tokens: 1024,
+    temperature: 0.7,
+    providers: {},
+  })
+  const [aiApiKey, setAiApiKey] = useState('')
+  const [aiSaving, setAiSaving] = useState(false)
+  const [aiSaved, setAiSaved] = useState(false)
+
   useEffect(() => {
     getConfig().then(data => setCfg(prev => ({ ...prev, ...data }))).catch(() => { })
+  }, [])
+
+  useEffect(() => {
+    getAiConfig().then(d => setAiCfg(prev => ({ ...prev, ...d }))).catch(() => {})
   }, [])
 
   const set = (key, val) => setCfg(prev => ({ ...prev, [key]: val }))
@@ -111,6 +140,33 @@ export default function ConfigPanel({ onConfigSaved }) {
     }
   }
 
+  const handleAiSave = async () => {
+    setAiSaving(true)
+    try {
+      const body = {
+        enabled: aiCfg.enabled,
+        use_builtin: aiCfg.use_builtin,
+        provider: aiCfg.provider,
+        model: aiCfg.model,
+        base_url: aiCfg.base_url,
+        max_tokens: aiCfg.max_tokens,
+        temperature: aiCfg.temperature,
+      }
+      if (aiApiKey) body.api_key = aiApiKey
+      await saveAiConfig(body)
+      setAiApiKey('')
+      // 刷新用量等信息
+      const fresh = await getAiConfig()
+      setAiCfg(prev => ({ ...prev, ...fresh }))
+      setAiSaved(true)
+      setTimeout(() => setAiSaved(false), 2000)
+    } catch (e) {
+      alert('AI 配置保存失败: ' + e.message)
+    } finally {
+      setAiSaving(false)
+    }
+  }
+
   const loadWallets = async () => {
     setLoadingWallets(true)
     try {
@@ -133,17 +189,57 @@ export default function ConfigPanel({ onConfigSaved }) {
         <div className="flex items-center justify-between">
           <div>
             <h3 className="text-sm font-semibold text-gray-200">Bot 状态</h3>
-            <p className="text-xs text-gray-500 mt-0.5">开启后自动监听CA并执行交易</p>
+            <p className="text-xs text-gray-500 mt-0.5">开启后监听 CA 推送，配合下方开关决定是否买入</p>
           </div>
           <Toggle
             checked={botEnabled}
             onChange={(v) => set('bot_enabled', v ? 'true' : 'false')}
           />
         </div>
-        {botEnabled && (
-          <div className="mt-3 text-xs text-accent-green flex items-center gap-1">
-            <div className="w-1.5 h-1.5 bg-accent-green rounded-full animate-pulse" />
-            运行中
+
+        {/* 信息流自动购买 */}
+        <div className={clsx(
+          'mt-3 pt-3 border-t border-dark-600 flex items-center justify-between',
+          !botEnabled && 'opacity-40 pointer-events-none'
+        )}>
+          <div>
+            <p className="text-sm text-gray-300 font-medium">信息流自动购买</p>
+            <p className="text-xs text-gray-500 mt-0.5">开启后：过滤通过的 CA 自动买入（全局参数）<br />关闭后：仅执行已配置跟单的喊单人信号</p>
+          </div>
+          <Toggle
+            checked={cfg.auto_buy_enabled === 'true'}
+            onChange={(v) => set('auto_buy_enabled', v ? 'true' : 'false')}
+          />
+        </div>
+
+        {/* 一键牛人榜跟单 */}
+        <div className="mt-3 pt-3 border-t border-dark-600 flex items-center justify-between">
+          <div>
+            <p className="text-sm text-gray-300 font-medium">一键牛人榜跟单</p>
+            <p className="text-xs text-gray-500 mt-0.5">开启后：牛人榜右上角显示「一键跟单」按钮，可批量添加跟单配置</p>
+          </div>
+          <Toggle
+            checked={cfg.leaderboard_batch_follow_enabled === 'true'}
+            onChange={(v) => set('leaderboard_batch_follow_enabled', v ? 'true' : 'false')}
+          />
+        </div>
+
+        {botEnabled ? (
+          cfg.auto_buy_enabled === 'true' ? (
+            <div className="mt-3 text-xs text-orange-400/80 flex items-center gap-1.5">
+              <span>⚡</span>
+              自动购买已开启 — 过滤通过即买入
+            </div>
+          ) : (
+            <div className="mt-3 text-xs text-blue-400/80 flex items-center gap-1.5">
+              <span>🔗</span>
+              跟单模式 — 仅对已配置跟单的喊单人执行买入
+            </div>
+          )
+        ) : (
+          <div className="mt-3 text-xs text-yellow-500/80 flex items-center gap-1.5">
+            <span>⚠️</span>
+            已停止 — 观察模式，不会执行任何买卖
           </div>
         )}
       </Card>
@@ -159,27 +255,35 @@ export default function ConfigPanel({ onConfigSaved }) {
               <span className="text-xs font-medium text-gray-300">AVE Trade API</span>
               <span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-900/30 text-yellow-400">用于买卖交易</span>
             </div>
-            <div className="space-y-1.5">
-              <div>
-                <label className="text-[10px] text-gray-500 mb-0.5 block">API Key</label>
-                <input
-                  type="password"
-                  value={cfg.ave_trade_api_key}
-                  onChange={e => set('ave_trade_api_key', e.target.value)}
-                  placeholder="Bearer token..."
-                  className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-200 font-mono placeholder-gray-600 focus:outline-none focus:border-accent-blue"
-                />
+            {/* 敏感字段：后端返回 __set__ 时显示已锁定状态 */}
+            {cfg.ave_trade_api_key === '__set__' ? (
+              <div className="flex items-center gap-2 px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg">
+                <span className="text-gray-600 text-sm">🔐</span>
+                <span className="text-xs text-gray-500">API Key 已设置（管理员权限查看）</span>
               </div>
-              <div>
-                <label className="text-[10px] text-gray-500 mb-0.5 block">Base URL</label>
-                <input
-                  type="text"
-                  value={cfg.ave_trade_api_url}
-                  onChange={e => set('ave_trade_api_url', e.target.value)}
-                  className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-400 font-mono focus:outline-none focus:border-accent-blue"
-                />
+            ) : (
+              <div className="space-y-1.5">
+                <div>
+                  <label className="text-[10px] text-gray-500 mb-0.5 block">API Key</label>
+                  <input
+                    type="password"
+                    value={cfg.ave_trade_api_key}
+                    onChange={e => set('ave_trade_api_key', e.target.value)}
+                    placeholder="Bearer token..."
+                    className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-200 font-mono placeholder-gray-600 focus:outline-none focus:border-accent-blue"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-gray-500 mb-0.5 block">Base URL</label>
+                  <input
+                    type="text"
+                    value={cfg.ave_trade_api_url}
+                    onChange={e => set('ave_trade_api_url', e.target.value)}
+                    className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-400 font-mono focus:outline-none focus:border-accent-blue"
+                  />
+                </div>
               </div>
-            </div>
+            )}
           </div>
 
           <div className="border-t border-dark-600" />
@@ -190,29 +294,204 @@ export default function ConfigPanel({ onConfigSaved }) {
               <span className="text-xs font-medium text-gray-300">AVE Data API</span>
               <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-900/30 text-blue-400">用于行情数据</span>
             </div>
-            <div className="space-y-1.5">
+            {cfg.ave_data_api_key === '__set__' ? (
+              <div className="flex items-center gap-2 px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg">
+                <span className="text-gray-600 text-sm">🔐</span>
+                <span className="text-xs text-gray-500">API Key 已设置（管理员权限查看）</span>
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                <div>
+                  <label className="text-[10px] text-gray-500 mb-0.5 block">API Key</label>
+                  <input
+                    type="password"
+                    value={cfg.ave_data_api_key}
+                    onChange={e => set('ave_data_api_key', e.target.value)}
+                    placeholder="Ave-Auth token..."
+                    className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-200 font-mono placeholder-gray-600 focus:outline-none focus:border-accent-blue"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-gray-500 mb-0.5 block">Base URL</label>
+                  <input
+                    type="text"
+                    value={cfg.ave_data_api_url}
+                    onChange={e => set('ave_data_api_url', e.target.value)}
+                    className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-400 font-mono focus:outline-none focus:border-accent-blue"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </Card>
+
+      {/* ── AI 接口配置 ───────────────────────────────────────── */}
+      <Card>
+        <div className="flex items-center justify-between mb-1">
+          <div>
+            <h3 className="text-sm font-semibold text-gray-200">AI 助手接口</h3>
+            <p className="text-xs text-gray-500 mt-0.5">配置右下角 AI 助手使用的大语言模型接口</p>
+          </div>
+          <Toggle
+            checked={aiCfg.enabled}
+            onChange={v => setAiCfg(prev => ({ ...prev, enabled: v }))}
+          />
+        </div>
+
+        {aiCfg.enabled && (
+          <div className="mt-3 space-y-4">
+            {/* 内置共享 Key 区域 */}
+            <div className="p-3 rounded-lg bg-dark-700 border border-dark-500 space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-gray-300">使用内置共享 Key</span>
+                    {aiCfg.builtin_available
+                      ? <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-900/30 text-green-400">可用</span>
+                      : <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-500">未配置</span>
+                    }
+                  </div>
+                  <div className="text-[10px] text-gray-500 mt-0.5">
+                    每日限额 {aiCfg.builtin_daily_limit} 次 · 已用 {aiCfg.builtin_used_today} · 剩余{' '}
+                    <span className={clsx('font-mono', aiCfg.builtin_remaining > 10 ? 'text-green-400' : aiCfg.builtin_remaining > 0 ? 'text-yellow-400' : 'text-red-400')}>
+                      {aiCfg.builtin_remaining}
+                    </span> 次
+                  </div>
+                </div>
+                <Toggle
+                  checked={aiCfg.use_builtin}
+                  onChange={v => setAiCfg(prev => ({ ...prev, use_builtin: v }))}
+                />
+              </div>
+
+              {/* 进度条 */}
+              {aiCfg.builtin_daily_limit > 0 && (
+                <div className="w-full bg-dark-600 rounded-full h-1.5 overflow-hidden">
+                  <div
+                    className={clsx('h-full rounded-full transition-all',
+                      aiCfg.builtin_remaining > 10 ? 'bg-green-400' :
+                      aiCfg.builtin_remaining > 0  ? 'bg-yellow-400' : 'bg-red-400'
+                    )}
+                    style={{ width: `${Math.min(100, (aiCfg.builtin_used_today / aiCfg.builtin_daily_limit) * 100)}%` }}
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* 自定义 Key 区域（内置关闭时展示，内置开启时折叠） */}
+            <div className={clsx('space-y-3', aiCfg.use_builtin && aiCfg.builtin_available ? 'opacity-50' : '')}>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-medium text-gray-300">自定义 API Key</span>
+                {aiCfg.use_builtin && aiCfg.builtin_available && (
+                  <span className="text-[10px] text-gray-600">（内置 Key 生效中，此处为备用）</span>
+                )}
+              </div>
+
+              {/* Provider 选择 */}
               <div>
-                <label className="text-[10px] text-gray-500 mb-0.5 block">API Key</label>
+                <label className="text-[10px] text-gray-500 mb-0.5 block">AI 提供商</label>
+                <select
+                  value={aiCfg.provider}
+                  onChange={e => setAiCfg(prev => ({ ...prev, provider: e.target.value, model: '' }))}
+                  className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-200 focus:outline-none focus:border-accent-blue"
+                >
+                  {Object.entries(aiCfg.providers || {}).map(([k, v]) => (
+                    <option key={k} value={k}>{v.name || k}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* 模型选择 */}
+              <div>
+                <label className="text-[10px] text-gray-500 mb-0.5 block">模型</label>
+                {(aiCfg.providers?.[aiCfg.provider]?.models || []).length > 0 ? (
+                  <select
+                    value={aiCfg.model}
+                    onChange={e => setAiCfg(prev => ({ ...prev, model: e.target.value }))}
+                    className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-200 focus:outline-none focus:border-accent-blue"
+                  >
+                    <option value="">-- 选择模型 --</option>
+                    {(aiCfg.providers[aiCfg.provider].models || []).map(m => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    value={aiCfg.model}
+                    onChange={e => setAiCfg(prev => ({ ...prev, model: e.target.value }))}
+                    placeholder="输入模型名称，如 gpt-4o-mini"
+                    className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-200 font-mono focus:outline-none focus:border-accent-blue"
+                  />
+                )}
+              </div>
+
+              {/* API Key */}
+              <div>
+                <label className="text-[10px] text-gray-500 mb-0.5 block">
+                  API Key {aiCfg.api_key_set && <span className="text-green-400">（已设置）</span>}
+                </label>
                 <input
                   type="password"
-                  value={cfg.ave_data_api_key}
-                  onChange={e => set('ave_data_api_key', e.target.value)}
-                  placeholder="Ave-Auth token..."
+                  value={aiApiKey}
+                  onChange={e => setAiApiKey(e.target.value)}
+                  placeholder={aiCfg.api_key_set ? '留空保持不变' : '填入你的 API Key'}
                   className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-200 font-mono placeholder-gray-600 focus:outline-none focus:border-accent-blue"
                 />
               </div>
+
+              {/* Base URL */}
               <div>
-                <label className="text-[10px] text-gray-500 mb-0.5 block">Base URL</label>
+                <label className="text-[10px] text-gray-500 mb-0.5 block">
+                  Base URL
+                  <span className="ml-1 text-gray-600">（cometapi: https://api.cometapi.com/v1）</span>
+                </label>
                 <input
-                  type="text"
-                  value={cfg.ave_data_api_url}
-                  onChange={e => set('ave_data_api_url', e.target.value)}
+                  value={aiCfg.base_url}
+                  onChange={e => setAiCfg(prev => ({ ...prev, base_url: e.target.value }))}
+                  placeholder="https://api.cometapi.com/v1"
                   className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-400 font-mono focus:outline-none focus:border-accent-blue"
                 />
               </div>
+
+              {/* 高级参数 */}
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-[10px] text-gray-500 mb-0.5 block">Max Tokens</label>
+                  <input
+                    type="number" min={128} max={8192}
+                    value={aiCfg.max_tokens}
+                    onChange={e => setAiCfg(prev => ({ ...prev, max_tokens: Number(e.target.value) }))}
+                    className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-200 focus:outline-none focus:border-accent-blue"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-gray-500 mb-0.5 block">Temperature</label>
+                  <input
+                    type="number" min={0} max={2} step={0.1}
+                    value={aiCfg.temperature}
+                    onChange={e => setAiCfg(prev => ({ ...prev, temperature: Number(e.target.value) }))}
+                    className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-200 focus:outline-none focus:border-accent-blue"
+                  />
+                </div>
+              </div>
             </div>
+
+            {/* 保存按钮 */}
+            <button
+              onClick={handleAiSave}
+              disabled={aiSaving}
+              className={clsx(
+                'w-full py-2 rounded-lg text-xs font-semibold transition-colors',
+                aiSaved
+                  ? 'bg-green-600/30 text-green-400 border border-green-700/40'
+                  : 'bg-accent-blue/80 hover:bg-accent-blue text-white'
+              )}
+            >
+              {aiSaving ? '保存中...' : aiSaved ? '已保存 ✓' : '保存 AI 配置'}
+            </button>
           </div>
-        </div>
+        )}
       </Card>
 
       {/* 交易参数 */}
@@ -224,7 +503,7 @@ export default function ConfigPanel({ onConfigSaved }) {
             value={cfg.buy_amount_usdt}
             onChange={v => set('buy_amount_usdt', v)}
             min={0.1} max={100} step={0.1}
-            hint="推荐 ≥ 1U，过小部分代币会模拟失败"
+            hint="统一填 U 金额，各链自动换算：BSC/ETH 用 USDT，BASE/XLAYER 用 USDC，SOL 按实时价格换算为 SOL"
           />
           <NumberInput
             label="最大并发持仓数"
@@ -253,7 +532,7 @@ export default function ConfigPanel({ onConfigSaved }) {
                 value={cfg.buy_amount_fallback_usdt}
                 onChange={v => set('buy_amount_fallback_usdt', v)}
                 min={1} max={100} step={0.5}
-                hint={`原始 ${cfg.buy_amount_usdt}U 失败 → 自动改用此金额重试`}
+                hint={`原始 ${cfg.buy_amount_usdt}U 失败 → 自动改用此金额重试（同样按链换算）`}
               />
             </div>
           )}
@@ -286,6 +565,27 @@ export default function ConfigPanel({ onConfigSaved }) {
             hint="同一 CA 买入失败后，冷却此时长内不再重试（0=不冷却；推荐 300 秒）"
           />
         </div>
+        {/* BNB 回退买入 */}
+        <div className="mt-3 p-3 rounded-lg bg-dark-700 border border-dark-500 space-y-1">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-xs font-medium text-gray-300">BNB 代替 USDT 买入（仅 BSC）</div>
+              <div className="text-[10px] text-gray-500 mt-0.5">
+                钱包 USDT 余额不足时，自动用等值 BNB 买入<br />
+                例如设定 10U 一笔，USDT 不足则换算为约等值 BNB 数量执行
+              </div>
+            </div>
+            <Toggle
+              checked={cfg.buy_with_bnb_fallback_enabled === 'true'}
+              onChange={v => set('buy_with_bnb_fallback_enabled', v ? 'true' : 'false')}
+            />
+          </div>
+          <p className="text-[10px] text-gray-600">
+            {cfg.buy_with_bnb_fallback_enabled === 'true'
+              ? '✅ 开启：USDT 不足时自动切换 BNB，按实时价格换算（60s缓存）'
+              : '关闭：USDT 余额不足时直接报错跳过'}
+          </p>
+        </div>
       </Card>
       <Card>
         <h3 className="text-sm font-semibold text-gray-200 mb-3">卖出策略</h3>
@@ -317,7 +617,22 @@ export default function ConfigPanel({ onConfigSaved }) {
       {/* ── 仪表盘显示 ────────────────────────────────────────── */}
       <Card>
         <h3 className="text-sm font-semibold text-gray-200 mb-3">仪表盘显示</h3>
-        <div className="space-y-1">
+        <div className="space-y-3">
+          {/* 实时日志开关 */}
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs text-gray-300 font-medium">显示实时日志</p>
+              <p className="text-xs text-gray-600 mt-0.5">关闭后右侧日志栏收起，页面更宽敞</p>
+            </div>
+            <Toggle
+              checked={localStorage.getItem('show_live_log') !== 'false'}
+              onChange={(v) => {
+                localStorage.setItem('show_live_log', v ? 'true' : 'false')
+                window.dispatchEvent(new CustomEvent('show_live_log_change', { detail: v }))
+              }}
+            />
+          </div>
+          <div className="border-t border-dark-700/50" />
           <label className="text-xs text-gray-400">持仓估值价格来源</label>
           <div className="flex gap-2 mt-1">
             {[
@@ -702,19 +1017,56 @@ export default function ConfigPanel({ onConfigSaved }) {
               value={cfg.gas_price_multiplier}
               onChange={v => set('gas_price_multiplier', v)}
               min={0.1} max={5.0} step={0.1}
-              hint="1.0=跟随网络实时价格（BSC约$0.6~0.8/笔）；>1.0加速但更贵"
+              hint="1.0=跟随网络实时价格；>1.0加速但更贵"
             />
             <NumberInput
               label="Approve GasPrice (Gwei)"
               value={cfg.approve_gas_price_gwei}
               onChange={v => set('approve_gas_price_gwei', v)}
               min={0.05} max={10.0} step={0.05}
-              hint="approve 一次性授权，推荐 1.0 Gwei（命中缓存后不再消耗）"
+              hint="approve 一次性授权，推荐 1.0 Gwei"
             />
           </div>
-          <p className="text-xs text-gray-600 mt-2">
-            ⚠️ BSC 每笔 swap 实际约 $0.6~0.9U（合约 gas 消耗约 200k~400k，不可避免）
-          </p>
+          {/* 广播模式切换 */}
+          <div className="mt-3 p-3 rounded-lg border border-dark-500 bg-dark-700/40">
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <p className="text-xs font-semibold text-gray-300">交易广播模式</p>
+                <p className="text-[10px] text-gray-500 mt-0.5">控制签名后的交易如何发送上链</p>
+              </div>
+              <div className="flex gap-1">
+                {[
+                  { val: 'ave',    label: 'AVE 广播',    desc: '经 AVE 服务器模拟验证后广播，gasPrice ≥ 1 Gwei，有 MEV 保护' },
+                  { val: 'direct', label: '直接广播',    desc: '跳过 AVE 模拟，直接 eth_sendRawTransaction，gasPrice 跟随实时网络（BSC 约 0.07 Gwei），Gas 费可降低 10-15 倍' },
+                ].map(m => (
+                  <button
+                    key={m.val}
+                    onClick={() => set('broadcast_mode', m.val)}
+                    title={m.desc}
+                    className={clsx(
+                      'px-2.5 py-1 text-[11px] rounded border transition-colors',
+                      cfg.broadcast_mode === m.val
+                        ? m.val === 'direct'
+                          ? 'border-green-600/60 text-green-400 bg-green-900/20'
+                          : 'border-accent-blue/60 text-accent-blue bg-accent-blue/10'
+                        : 'border-dark-500 text-gray-500 hover:text-gray-300'
+                    )}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {cfg.broadcast_mode === 'direct' ? (
+              <p className="text-[10px] text-green-400/80">
+                ✅ 直接广播：gasPrice 跟随实时网络（BSC 当前约 0.07 Gwei），每笔 Gas 约 <strong>0.02-0.03U</strong>，比 AVE 广播便宜约 10 倍。注意：无 AVE 模拟预检，貔貅代币可能直接 revert 损失 Gas。
+              </p>
+            ) : (
+              <p className="text-[10px] text-gray-600">
+                AVE 广播：经模拟验证，可提前识别 3025 错误，gasPrice 强制 ≥ 1 Gwei，每笔 Gas 约 0.2-0.3U。
+              </p>
+            )}
+          </div>
         </div>
       </Card>
       <Card>
@@ -919,7 +1271,7 @@ export function GasAnalysisPanel() {
                   {REASON_ZH_G[t.reason] || t.reason}
                 </span>
                 <span className="text-gray-700 w-24 text-right shrink-0 text-[10px] hidden group-hover:block">
-                  {t.close_time?.slice(5, 16).replace('T', ' ')}
+                  {t.close_time ? new Date(t.close_time).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : ''}
                 </span>
               </div>
             )
