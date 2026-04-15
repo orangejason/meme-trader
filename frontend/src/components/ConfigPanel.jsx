@@ -57,6 +57,7 @@ const FILTER_DEFAULTS = {
 }
 
 export default function ConfigPanel({ onConfigSaved }) {
+  const [showApiKey, setShowApiKey] = useState(false)
   const [cfg, setCfg] = useState({
     bot_enabled: 'false',
     auto_buy_enabled: 'false',
@@ -265,13 +266,23 @@ export default function ConfigPanel({ onConfigSaved }) {
               <div className="space-y-1.5">
                 <div>
                   <label className="text-[10px] text-gray-500 mb-0.5 block">API Key</label>
-                  <input
-                    type="password"
-                    value={cfg.ave_trade_api_key}
-                    onChange={e => set('ave_trade_api_key', e.target.value)}
-                    placeholder="Bearer token..."
-                    className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-xs text-gray-200 font-mono placeholder-gray-600 focus:outline-none focus:border-accent-blue"
-                  />
+                  <div className="relative flex items-center">
+                    <input
+                      type={showApiKey ? "text" : "password"}
+                      value={cfg.ave_trade_api_key}
+                      onChange={e => set('ave_trade_api_key', e.target.value)}
+                      placeholder="Bearer token..."
+                      className="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 pr-8 text-xs text-gray-200 font-mono placeholder-gray-600 focus:outline-none focus:border-accent-blue"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowApiKey(v => !v)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 text-xs"
+                      title={showApiKey ? '隐藏' : '显示'}
+                    >
+                      {showApiKey ? '🙈' : '👁'}
+                    </button>
+                  </div>
                 </div>
                 <div>
                   <label className="text-[10px] text-gray-500 mb-0.5 block">Base URL</label>
