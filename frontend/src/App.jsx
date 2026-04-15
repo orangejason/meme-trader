@@ -246,37 +246,6 @@ export default function App() {
             <HeaderStats stats={stats} posCount={posCount} />
           </div>
           <div className="flex items-center gap-2 shrink-0">
-            {/* 管理员入口 */}
-            {isAdmin ? (
-              <button
-                onClick={() => setShowAdminPanel(true)}
-                title="管理员控制台"
-                className="w-8 h-8 flex items-center justify-center rounded-lg border border-yellow-700/40 text-yellow-500 bg-yellow-900/10 hover:bg-yellow-900/25 transition-all text-sm"
-              >
-                🔐
-              </button>
-            ) : (
-              <button
-                onClick={() => setShowLogin(true)}
-                title="管理员登录"
-                className="w-8 h-8 flex items-center justify-center rounded-lg border border-dark-500 text-gray-600 hover:text-gray-400 hover:border-dark-400 transition-all text-sm"
-              >
-                🔒
-              </button>
-            )}
-            {/* 音效开关 */}
-            <button
-              onClick={toggleMute}
-              title={muted ? '点击开启音效' : '点击静音'}
-              className={clsx(
-                'w-8 h-8 flex items-center justify-center rounded-lg border text-base transition-all',
-                muted
-                  ? 'border-dark-500 text-gray-600 bg-dark-700 hover:border-gray-500 hover:text-gray-400'
-                  : 'border-accent-blue/40 text-accent-blue bg-accent-blue/10 hover:bg-accent-blue/20'
-              )}
-            >
-              {muted ? '🔕' : '🔔'}
-            </button>
             <Toggle
               checked={botEnabled}
               onChange={handleBotToggle}
